@@ -30,7 +30,6 @@ fn main() -> eframe::Result {
 struct Imeji {
     image: Option<egui::ColorImage>,
     texture: Option<egui::TextureHandle>,
-    //path: Option<PathBuf>,
 }
 
 #[derive(FromArgs)]
@@ -41,8 +40,6 @@ struct Cli {
 }
 
 impl eframe::App for Imeji {
-    fn save(&mut self, _storage: &mut dyn eframe::Storage) {}
-    
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.input(|i| {
             if !i.raw.dropped_files.is_empty() {
