@@ -1,0 +1,4 @@
+// app.rc
+// '1' adalah ID dari resource ikon.
+// "icon.ico" adalah nama file ikon yang harus ada di root proyek Anda.
+1 ICON "icon.ico"

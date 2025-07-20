@@ -2,6 +2,7 @@
 name = "imeji"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [[bin]]
 name = "imeji"
@@ -23,3 +24,6 @@ eframe = { version = "*", features = ["persistence"] }
 egui_extras = { version="*", features = ["image"]}
 image ={ version = "*", features = ["webp"] }
 argh = "*"
+
+[build-dependencies]
+winres = "0.1"

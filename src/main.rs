@@ -1,7 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use eframe::egui::{self};
 use argh::FromArgs;
+use eframe::egui;
+use image::GenericImageView;
 use std::path::PathBuf;
 
 fn main() -> eframe::Result {
@@ -10,6 +11,10 @@ fn main() -> eframe::Result {
     let initial_path = cli.file.map(|s| PathBuf::from(s));
 
     options.persist_window = true;
+
+    if let Ok(icon) = load_icon() {
+        options.viewport = egui::ViewportBuilder::default().with_icon(icon);
+    }
 
     eframe::run_native(
         "imeji",
@@ -22,8 +27,19 @@ fn main() -> eframe::Result {
                 }
             }
             Ok(Box::new(app))
-        })
+        }),
     )
+}
+
+fn load_icon() -> Result<egui::IconData, Box<dyn std::error::Error>> {
+    let image = image::load_from_memory(include_bytes!("../icon.ico"))?;
+    let (width, height) = image.dimensions(); // Get dimensions before conversion
+    let image_buffer = image.to_rgba8();
+    Ok(egui::IconData {
+        rgba: image_buffer.into_raw(),
+        width,
+        height,
+    })
 }
 
 #[derive(Default)]
@@ -59,8 +75,8 @@ impl eframe::App for Imeji {
                 egui::Modifiers::CTRL,
                 egui::Key::W,
             )) {
-               self.image = None;
-               self.texture = None; 
+                self.image = None;
+                self.texture = None;
             }
         });
 
@@ -96,7 +112,10 @@ impl Imeji {
             Ok(dynamic_image) => {
                 let rgba_image = dynamic_image.to_rgba8();
                 let size = [rgba_image.width() as usize, rgba_image.height() as usize];
-                self.image = Some(egui::ColorImage::from_rgba_unmultiplied(size, &rgba_image));
+                self.image = Some(egui::ColorImage::from_rgba_unmultiplied(
+                    size,
+                    &rgba_image,
+                ));
                 self.texture = None;
             }
             Err(e) => println!("ImageError : {e}"),
