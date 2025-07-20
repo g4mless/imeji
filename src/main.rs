@@ -12,9 +12,14 @@ fn main() -> eframe::Result {
 
     options.persist_window = true;
 
+    let mut viewport_builder = egui::ViewportBuilder::default()
+        .with_min_inner_size([600.0, 600.0]);
+
     if let Ok(icon) = load_icon() {
-        options.viewport = egui::ViewportBuilder::default().with_icon(icon);
+        viewport_builder = viewport_builder.with_icon(icon);
     }
+
+    options.viewport = viewport_builder;
 
     eframe::run_native(
         "imeji",
