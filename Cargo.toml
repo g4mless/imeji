@@ -10,7 +10,13 @@ path = "src/main.rs"
 [target.'cfg(windows)'.bin.imeji]
 subsystem = "windows"
 
-[target.'cfg(windows)'.dependencies]
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
 
 [dependencies]
 eframe = { version = "*", features = ["persistence"] }
