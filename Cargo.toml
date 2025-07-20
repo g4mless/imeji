@@ -1,0 +1,19 @@
+[package]
+name = "imeji"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "imeji"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.bin.imeji]
+subsystem = "windows"
+
+[target.'cfg(windows)'.dependencies]
+
+[dependencies]
+eframe = { version = "*", features = ["persistence"] }
+egui_extras = { version="*", features = ["image"]}
+image ={ version = "*", features = ["webp"] }
+argh = "*"
