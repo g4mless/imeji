@@ -25,7 +25,7 @@ fn main() -> eframe::Result {
         "Imeji",
         options,
         Box::new(move |_| {
-            let mut app = Imeji::default();
+            let mut app = Imeji::new();
             if let Some(p) = initial_path {
                 if let Ok(bytes) = std::fs::read(p) {
                     app.load_image(&bytes);
@@ -51,6 +51,25 @@ fn load_icon() -> Result<egui::IconData, Box<dyn std::error::Error>> {
 struct Imeji {
     image: Option<egui::ColorImage>,
     texture: Option<egui::TextureHandle>,
+    zoom: f32,
+    pan_offset: egui::Vec2,
+    is_dragging: bool,
+    last_mouse_pos: Option<egui::Pos2>,
+    last_window_size: Option<egui::Vec2>,
+}
+
+impl Imeji {
+    fn new() -> Self {
+        Self {
+            image: None,
+            texture: None,
+            zoom: 1.0,
+            pan_offset: egui::Vec2::ZERO,
+            is_dragging: false,
+            last_mouse_pos: None,
+            last_window_size: None,
+        }
+    }
 }
 
 #[derive(FromArgs)]
@@ -82,26 +101,89 @@ impl eframe::App for Imeji {
             )) {
                 self.image = None;
                 self.texture = None;
+                self.zoom = 1.0;
+                self.pan_offset = egui::Vec2::ZERO;
             }
         });
+
+        let current_window_size = ctx.screen_rect().size();
+        if let Some(last_size) = self.last_window_size {
+            let size_increase = current_window_size - last_size;
+            if size_increase.x > 100.0 || size_increase.y > 100.0 {
+                self.zoom = 1.0;
+                self.pan_offset = egui::Vec2::ZERO;
+            }
+        }
+        self.last_window_size = Some(current_window_size);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(image) = &self.image {
                 let texture = self.texture.get_or_insert_with(|| {
-                    ctx.load_texture("loaded_image", image.clone(), egui::TextureOptions::default())
+                    let texture_options = egui::TextureOptions {
+                        magnification: egui::TextureFilter::Linear,
+                        minification: egui::TextureFilter::Linear,
+                        wrap_mode: egui::TextureWrapMode::ClampToEdge,
+                        mipmap_mode: None,
+                    };
+                    ctx.load_texture("loaded_image", image.clone(), texture_options)
                 });
+
                 let image_size = texture.size_vec2();
                 let available_size = ui.available_size();
 
-                let scale = (available_size.x / image_size.x)
+                let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll_delta != 0.0 {
+                    let zoom_factor = 1.0 + scroll_delta * 0.001;
+                    let old_zoom = self.zoom;
+                    self.zoom = (self.zoom * zoom_factor).clamp(1.0, 10.0);
+                    
+                    if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                        let center = ui.available_rect_before_wrap().center();
+                        let mouse_offset = mouse_pos - center;
+                        let zoom_change = self.zoom / old_zoom - 1.0;
+                        self.pan_offset -= mouse_offset * zoom_change;
+                    }
+                }
+
+                let mouse_pos = ui.input(|i| i.pointer.hover_pos());
+                let is_primary_down = ui.input(|i| i.pointer.primary_down());
+
+                if is_primary_down && mouse_pos.is_some() {
+                    let current_pos = mouse_pos.unwrap();
+                    
+                    if !self.is_dragging {
+                        self.is_dragging = true;
+                        self.last_mouse_pos = Some(current_pos);
+                    } else if let Some(last_pos) = self.last_mouse_pos {
+                        let delta = current_pos - last_pos;
+                        self.pan_offset += delta;
+                        self.last_mouse_pos = Some(current_pos);
+                    }
+                } else {
+                    self.is_dragging = false;
+                    self.last_mouse_pos = None;
+                }
+
+                let base_scale = (available_size.x / image_size.x)
                     .min(available_size.y / image_size.y)
                     .min(1.0);
+                
+                let display_size = image_size * base_scale * self.zoom;
+                let center = ui.available_rect_before_wrap().center();
+                let image_pos = center - display_size * 0.5 + self.pan_offset;
 
-                let display_size = image_size * scale;
+                let image_rect = egui::Rect::from_min_size(image_pos, display_size);
+                let _response = ui.allocate_rect(ui.available_rect_before_wrap(), egui::Sense::click_and_drag());
+                
+                if ui.is_rect_visible(image_rect) {
+                    ui.painter().image(
+                        texture.id(),
+                        image_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
 
-                ui.centered_and_justified(|ui| {
-                    ui.image(egui::load::SizedTexture::new(texture, display_size));
-                });
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.label("Drop img here");
@@ -122,6 +204,12 @@ impl Imeji {
                     &rgba_image,
                 ));
                 self.texture = None;
+                // Reset zoom and pan when loading new image
+                self.zoom = 1.0;
+                self.pan_offset = egui::Vec2::ZERO;
+                self.is_dragging = false;
+                self.last_mouse_pos = None;
+                self.last_window_size = None;
             }
             Err(e) => println!("ImageError : {e}"),
         }
