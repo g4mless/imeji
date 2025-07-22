@@ -123,7 +123,7 @@ impl eframe::App for Imeji {
                         magnification: egui::TextureFilter::Linear,
                         minification: egui::TextureFilter::Linear,
                         wrap_mode: egui::TextureWrapMode::ClampToEdge,
-                        mipmap_mode: None,
+                        mipmap_mode: Some(egui::TextureFilter::Linear),
                     };
                     ctx.load_texture("loaded_image", image.clone(), texture_options)
                 });
