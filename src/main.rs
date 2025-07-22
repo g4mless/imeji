@@ -104,7 +104,7 @@ impl eframe::App for Imeji {
                 });
             } else {
                 ui.centered_and_justified(|ui| {
-                    ui.label("Drop img here buds");
+                    ui.label("Drop img here");
                 });
             }
         });
