@@ -56,6 +56,9 @@ struct Imeji {
     is_dragging: bool,
     last_mouse_pos: Option<egui::Pos2>,
     last_window_size: Option<egui::Vec2>,
+    is_animating_to_center: bool,
+    animation_start_offset: egui::Vec2,
+    animation_start_time: Option<std::time::Instant>,
 }
 
 impl Imeji {
@@ -68,6 +71,9 @@ impl Imeji {
             is_dragging: false,
             last_mouse_pos: None,
             last_window_size: None,
+            is_animating_to_center: false,
+            animation_start_offset: egui::Vec2::ZERO,
+            animation_start_time: None,
         }
     }
 }
@@ -137,14 +143,45 @@ impl eframe::App for Imeji {
                     let old_zoom = self.zoom;
                     self.zoom = (self.zoom * zoom_factor).clamp(1.0, 10.0);
                     
-                    // Reset pan offset to center when zoom is 1.0
-                    if self.zoom == 1.0 {
-                        self.pan_offset = egui::Vec2::ZERO;
-                    } else if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
-                        let center = ui.available_rect_before_wrap().center();
-                        let mouse_offset = mouse_pos - center;
-                        let zoom_change = self.zoom / old_zoom - 1.0;
-                        self.pan_offset -= mouse_offset * zoom_change;
+                    // Start animation to center when zoom reaches 1.0
+                    if self.zoom == 1.0 && old_zoom > 1.0 {
+                        self.is_animating_to_center = true;
+                        self.animation_start_offset = self.pan_offset;
+                        self.animation_start_time = Some(std::time::Instant::now());
+                    } else if self.zoom > 1.0 {
+                        // Stop animation if zooming back in
+                        self.is_animating_to_center = false;
+                        if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                            let center = ui.available_rect_before_wrap().center();
+                            let mouse_offset = mouse_pos - center;
+                            let zoom_change = self.zoom / old_zoom - 1.0;
+                            self.pan_offset -= mouse_offset * zoom_change;
+                        }
+                    }
+                }
+
+                // Handle animation to center
+                if self.is_animating_to_center {
+                    if let Some(start_time) = self.animation_start_time {
+                        let elapsed = start_time.elapsed().as_secs_f32();
+                        let animation_duration = 0.3; // 300ms animation
+                        
+                        if elapsed >= animation_duration {
+                            // Animation complete
+                            self.pan_offset = egui::Vec2::ZERO;
+                            self.is_animating_to_center = false;
+                            self.animation_start_time = None;
+                        } else {
+                            // Smooth easing function (ease-out)
+                            let t = elapsed / animation_duration;
+                            let eased_t = 1.0 - (1.0 - t).powi(3); // cubic ease-out
+                            
+                            // Interpolate from start offset to zero
+                            self.pan_offset = self.animation_start_offset * (1.0 - eased_t);
+                            
+                            // Request repaint for smooth animation
+                            ctx.request_repaint();
+                        }
                     }
                 }
 
@@ -216,6 +253,8 @@ impl Imeji {
                 self.is_dragging = false;
                 self.last_mouse_pos = None;
                 self.last_window_size = None;
+                self.is_animating_to_center = false;
+                self.animation_start_time = None;
             }
             Err(e) => println!("ImageError : {e}"),
         }
