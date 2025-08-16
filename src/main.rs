@@ -137,7 +137,10 @@ impl eframe::App for Imeji {
                     let old_zoom = self.zoom;
                     self.zoom = (self.zoom * zoom_factor).clamp(1.0, 10.0);
                     
-                    if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    // Reset pan offset to center when zoom is 1.0
+                    if self.zoom == 1.0 {
+                        self.pan_offset = egui::Vec2::ZERO;
+                    } else if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
                         let center = ui.available_rect_before_wrap().center();
                         let mouse_offset = mouse_pos - center;
                         let zoom_change = self.zoom / old_zoom - 1.0;
@@ -156,7 +159,10 @@ impl eframe::App for Imeji {
                         self.last_mouse_pos = Some(current_pos);
                     } else if let Some(last_pos) = self.last_mouse_pos {
                         let delta = current_pos - last_pos;
-                        self.pan_offset += delta;
+                        // Only allow panning when zoom is greater than 1.0
+                        if self.zoom > 1.0 {
+                            self.pan_offset += delta;
+                        }
                         self.last_mouse_pos = Some(current_pos);
                     }
                 } else {
