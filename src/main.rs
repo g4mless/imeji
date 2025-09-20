@@ -27,8 +27,9 @@ fn main() -> eframe::Result {
         Box::new(move |_| {
             let mut app = Imeji::new();
             if let Some(p) = initial_path {
-                if let Ok(bytes) = std::fs::read(p) {
-                    app.load_image(&bytes);
+                if let Ok(bytes) = std::fs::read(&p) {
+                    let filename = p.file_name().map(|n| n.to_string_lossy().to_string());
+                    app.load_image(&bytes, filename);
                 }
             }
             Ok(Box::new(app))
@@ -51,6 +52,7 @@ fn load_icon() -> Result<egui::IconData, Box<dyn std::error::Error>> {
 struct Imeji {
     image: Option<egui::ColorImage>,
     texture: Option<egui::TextureHandle>,
+    filename: Option<String>,
     zoom: f32,
     pan_offset: egui::Vec2,
     is_dragging: bool,
@@ -66,6 +68,7 @@ impl Imeji {
         Self {
             image: None,
             texture: None,
+            filename: None,
             zoom: 1.0,
             pan_offset: egui::Vec2::ZERO,
             is_dragging: false,
@@ -87,13 +90,25 @@ struct Cli {
 
 impl eframe::App for Imeji {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Update window title based on loaded image
+        let title = self.filename.as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or("Imeji");
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.to_string()));
+
         ctx.input(|i| {
             if !i.raw.dropped_files.is_empty() {
-                if let Some(bytes) = &i.raw.dropped_files[0].bytes {
-                    self.load_image(bytes);
-                } else if let Some(path) = &i.raw.dropped_files[0].path {
+                let dropped_file = &i.raw.dropped_files[0];
+                let filename = dropped_file.path.as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .or_else(|| if dropped_file.name.is_empty() { None } else { Some(dropped_file.name.clone()) });
+
+                if let Some(bytes) = &dropped_file.bytes {
+                    self.load_image(bytes, filename);
+                } else if let Some(path) = &dropped_file.path {
                     if let Ok(bytes) = std::fs::read(path) {
-                        self.load_image(&bytes);
+                        self.load_image(&bytes, filename);
                     }
                 }
             }
@@ -107,6 +122,7 @@ impl eframe::App for Imeji {
             )) {
                 self.image = None;
                 self.texture = None;
+                self.filename = None;
                 self.zoom = 1.0;
                 self.pan_offset = egui::Vec2::ZERO;
             }
@@ -237,7 +253,7 @@ impl eframe::App for Imeji {
 }
 
 impl Imeji {
-    fn load_image(&mut self, bytes: &[u8]) {
+    fn load_image(&mut self, bytes: &[u8], filename: Option<String>) {
         match image::load_from_memory(bytes) {
             Ok(dynamic_image) => {
                 let rgba_image = dynamic_image.to_rgba8();
@@ -246,6 +262,7 @@ impl Imeji {
                     size,
                     &rgba_image,
                 ));
+                self.filename = filename;
                 self.texture = None;
                 // Reset zoom and pan when loading new image
                 self.zoom = 1.0;
