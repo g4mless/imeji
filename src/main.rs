@@ -61,6 +61,7 @@ struct Imeji {
     is_animating_to_center: bool,
     animation_start_offset: egui::Vec2,
     animation_start_time: Option<std::time::Instant>,
+    last_update_time: Option<std::time::Instant>,
 }
 
 impl Imeji {
@@ -77,6 +78,7 @@ impl Imeji {
             is_animating_to_center: false,
             animation_start_offset: egui::Vec2::ZERO,
             animation_start_time: None,
+            last_update_time: None,
         }
     }
 }
@@ -90,53 +92,96 @@ struct Cli {
 
 impl eframe::App for Imeji {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let now = std::time::Instant::now();
+
+        // Frame rate limiting
+        let has_user_interaction = ctx.input(|i| {
+            !i.raw.dropped_files.is_empty() ||
+            i.smooth_scroll_delta.y != 0.0 ||
+            i.pointer.primary_down()
+        });
+
+        let should_update = if let Some(last_time) = self.last_update_time {
+            if has_user_interaction || self.image.is_some() || self.is_animating_to_center {
+                true // Always update on user interaction, when image is loaded, or during animation
+            } else {
+                now.duration_since(last_time).as_millis() >= 32 // ~30 FPS when completely idle (no image)
+            }
+        } else {
+            true // First update
+        };
+
+        if !should_update {
+            return; // Skip this frame to reduce CPU usage
+        }
+
+        self.last_update_time = Some(now);
+
+        // Poll input once and store results to avoid multiple calls
+        let input = ctx.input(|i| {
+            let dropped_files = i.raw.dropped_files.clone();
+            let smooth_scroll_delta = i.smooth_scroll_delta.y;
+            let mouse_pos = i.pointer.hover_pos();
+            let is_primary_down = i.pointer.primary_down();
+
+            (dropped_files, smooth_scroll_delta, mouse_pos, is_primary_down)
+        });
+
+        let (dropped_files, smooth_scroll_delta, mouse_pos, is_primary_down) = input;
+
+        // Handle keyboard shortcut separately (needs mutable access)
+        let keyboard_shortcut = ctx.input_mut(|i| {
+            i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL,
+                egui::Key::W,
+            ))
+        });
+
         // Update window title based on loaded image
         let title = self.filename.as_ref()
             .map(|s| s.as_str())
             .unwrap_or("Imeji");
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.to_string()));
 
-        ctx.input(|i| {
-            if !i.raw.dropped_files.is_empty() {
-                let dropped_file = &i.raw.dropped_files[0];
-                let filename = dropped_file.path.as_ref()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().to_string())
-                    .or_else(|| if dropped_file.name.is_empty() { None } else { Some(dropped_file.name.clone()) });
+        // Handle dropped files
+        if !dropped_files.is_empty() {
+            let dropped_file = &dropped_files[0];
+            let filename = dropped_file.path.as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .or_else(|| if dropped_file.name.is_empty() { None } else { Some(dropped_file.name.clone()) });
 
-                if let Some(bytes) = &dropped_file.bytes {
-                    self.load_image(bytes, filename);
-                } else if let Some(path) = &dropped_file.path {
-                    if let Ok(bytes) = std::fs::read(path) {
-                        self.load_image(&bytes, filename);
-                    }
+            if let Some(bytes) = &dropped_file.bytes {
+                self.load_image(bytes, filename);
+            } else if let Some(path) = &dropped_file.path {
+                if let Ok(bytes) = std::fs::read(path) {
+                    self.load_image(&bytes, filename);
                 }
             }
-        });
+        }
 
         // Ctrl+W = Close Image
-        ctx.input_mut(|i| {
-            if i.consume_shortcut(&egui::KeyboardShortcut::new(
-                egui::Modifiers::CTRL,
-                egui::Key::W,
-            )) {
-                self.image = None;
-                self.texture = None;
-                self.filename = None;
-                self.zoom = 1.0;
-                self.pan_offset = egui::Vec2::ZERO;
-            }
-        });
+        if keyboard_shortcut {
+            self.image = None;
+            self.texture = None;
+            self.filename = None;
+            self.zoom = 1.0;
+            self.pan_offset = egui::Vec2::ZERO;
+        }
 
         let current_window_size = ctx.screen_rect().size();
         if let Some(last_size) = self.last_window_size {
-            let size_increase = current_window_size - last_size;
-            if size_increase.x > 100.0 || size_increase.y > 100.0 {
-                self.zoom = 1.0;
-                self.pan_offset = egui::Vec2::ZERO;
+            if current_window_size != last_size {
+                let size_increase = current_window_size - last_size;
+                if size_increase.x > 100.0 || size_increase.y > 100.0 {
+                    self.zoom = 1.0;
+                    self.pan_offset = egui::Vec2::ZERO;
+                }
+                self.last_window_size = Some(current_window_size);
             }
+        } else {
+            self.last_window_size = Some(current_window_size);
         }
-        self.last_window_size = Some(current_window_size);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE) // Remove default frame/padding
@@ -157,12 +202,11 @@ impl eframe::App for Imeji {
                 // Use screen rect instead of available_size to avoid UI padding
                 let available_size = screen_rect.size();
 
-                let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
-                if scroll_delta != 0.0 {
-                    let zoom_factor = 1.0 + scroll_delta * 0.001;
+                if smooth_scroll_delta != 0.0 {
+                    let zoom_factor = 1.0 + smooth_scroll_delta * 0.001;
                     let old_zoom = self.zoom;
                     self.zoom = (self.zoom * zoom_factor).clamp(1.0, 10.0);
-                    
+
                     // Start animation to center when zoom reaches 1.0
                     if self.zoom == 1.0 && old_zoom > 1.0 {
                         self.is_animating_to_center = true;
@@ -171,9 +215,9 @@ impl eframe::App for Imeji {
                     } else if self.zoom > 1.0 {
                         // Stop animation if zooming back in
                         self.is_animating_to_center = false;
-                        if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                        if let Some(current_mouse_pos) = mouse_pos {
                             let center = screen_rect.center();
-                            let mouse_offset = mouse_pos - center;
+                            let mouse_offset = current_mouse_pos - center;
                             let zoom_change = self.zoom / old_zoom - 1.0;
                             self.pan_offset -= mouse_offset * zoom_change;
                         }
@@ -191,26 +235,21 @@ impl eframe::App for Imeji {
                             self.pan_offset = egui::Vec2::ZERO;
                             self.is_animating_to_center = false;
                             self.animation_start_time = None;
+                            self.last_update_time = None;
                         } else {
                             // Smooth easing function (ease-out)
                             let t = elapsed / animation_duration;
                             let eased_t = 1.0 - (1.0 - t).powi(3); // cubic ease-out
-                            
+
                             // Interpolate from start offset to zero
                             self.pan_offset = self.animation_start_offset * (1.0 - eased_t);
-                            
-                            // Request repaint for smooth animation
-                            ctx.request_repaint();
                         }
                     }
                 }
 
-                let mouse_pos = ui.input(|i| i.pointer.hover_pos());
-                let is_primary_down = ui.input(|i| i.pointer.primary_down());
-
                 if is_primary_down && mouse_pos.is_some() {
                     let current_pos = mouse_pos.unwrap();
-                    
+
                     if !self.is_dragging {
                         self.is_dragging = true;
                         self.last_mouse_pos = Some(current_pos);
