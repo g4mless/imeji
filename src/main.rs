@@ -122,7 +122,9 @@ impl eframe::App for Imeji {
         }
         self.last_window_size = Some(current_window_size);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE) // Remove default frame/padding
+            .show(ctx, |ui| {
             if let Some(image) = &self.image {
                 let texture = self.texture.get_or_insert_with(|| {
                     let texture_options = egui::TextureOptions {
@@ -135,7 +137,9 @@ impl eframe::App for Imeji {
                 });
 
                 let image_size = texture.size_vec2();
-                let available_size = ui.available_size();
+                let screen_rect = ctx.screen_rect();
+                // Use screen rect instead of available_size to avoid UI padding
+                let available_size = screen_rect.size();
 
                 let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
                 if scroll_delta != 0.0 {
@@ -152,7 +156,7 @@ impl eframe::App for Imeji {
                         // Stop animation if zooming back in
                         self.is_animating_to_center = false;
                         if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
-                            let center = ui.available_rect_before_wrap().center();
+                            let center = screen_rect.center();
                             let mouse_offset = mouse_pos - center;
                             let zoom_change = self.zoom / old_zoom - 1.0;
                             self.pan_offset -= mouse_offset * zoom_change;
@@ -210,7 +214,7 @@ impl eframe::App for Imeji {
                 let base_scale = (available_size.x / image_size.x)
                     .min(available_size.y / image_size.y)
                     .min(1.0);
-                
+
                 let display_size = image_size * base_scale * self.zoom;
                 let center = ui.available_rect_before_wrap().center();
                 let image_pos = center - display_size * 0.5 + self.pan_offset;
@@ -227,10 +231,6 @@ impl eframe::App for Imeji {
                     );
                 }
 
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Drop img here");
-                });
             }
         });
     }
