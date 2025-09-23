@@ -11,7 +11,8 @@ fn main() -> eframe::Result {
     let initial_path = cli.file.map(|s| PathBuf::from(s));
 
     options.persist_window = true;
-
+    options.vsync = true;
+    
     let mut viewport_builder = egui::ViewportBuilder::default()
         .with_min_inner_size([480.0, 480.0]);
 
@@ -61,7 +62,7 @@ struct Imeji {
     is_animating_to_center: bool,
     animation_start_offset: egui::Vec2,
     animation_start_time: Option<std::time::Instant>,
-    last_update_time: Option<std::time::Instant>,
+    last_title: Option<String>,
 }
 
 impl Imeji {
@@ -78,7 +79,7 @@ impl Imeji {
             is_animating_to_center: false,
             animation_start_offset: egui::Vec2::ZERO,
             animation_start_time: None,
-            last_update_time: None,
+            last_title: None,
         }
     }
 }
@@ -92,30 +93,7 @@ struct Cli {
 
 impl eframe::App for Imeji {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let now = std::time::Instant::now();
-
-        // Frame rate limiting
-        let has_user_interaction = ctx.input(|i| {
-            !i.raw.dropped_files.is_empty() ||
-            i.smooth_scroll_delta.y != 0.0 ||
-            i.pointer.primary_down()
-        });
-
-        let should_update = if let Some(last_time) = self.last_update_time {
-            if has_user_interaction || self.image.is_some() || self.is_animating_to_center {
-                true // Always update on user interaction, when image is loaded, or during animation
-            } else {
-                now.duration_since(last_time).as_millis() >= 32 // ~30 FPS when completely idle (no image)
-            }
-        } else {
-            true // First update
-        };
-
-        if !should_update {
-            return; // Skip this frame to reduce CPU usage
-        }
-
-        self.last_update_time = Some(now);
+        // only repaint on input or when requested (animations, etc.)
 
         // Poll input once and store results to avoid multiple calls
         let input = ctx.input(|i| {
@@ -137,11 +115,12 @@ impl eframe::App for Imeji {
             ))
         });
 
-        // Update window title based on loaded image
-        let title = self.filename.as_ref()
-            .map(|s| s.as_str())
-            .unwrap_or("Imeji");
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.to_string()));
+        // Update window title when it changes
+        let title = self.filename.as_deref().unwrap_or("Imeji");
+        if self.last_title.as_deref() != Some(title) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.to_string()));
+            self.last_title = Some(title.to_string());
+        }
 
         // Handle dropped files
         if !dropped_files.is_empty() {
@@ -153,9 +132,11 @@ impl eframe::App for Imeji {
 
             if let Some(bytes) = &dropped_file.bytes {
                 self.load_image(bytes, filename);
+                ctx.request_repaint();
             } else if let Some(path) = &dropped_file.path {
                 if let Ok(bytes) = std::fs::read(path) {
                     self.load_image(&bytes, filename);
+                    ctx.request_repaint();
                 }
             }
         }
@@ -222,6 +203,8 @@ impl eframe::App for Imeji {
                             self.pan_offset -= mouse_offset * zoom_change;
                         }
                     }
+
+                    ctx.request_repaint();
                 }
 
                 // Handle animation to center
@@ -235,7 +218,6 @@ impl eframe::App for Imeji {
                             self.pan_offset = egui::Vec2::ZERO;
                             self.is_animating_to_center = false;
                             self.animation_start_time = None;
-                            self.last_update_time = None;
                         } else {
                             // Smooth easing function (ease-out)
                             let t = elapsed / animation_duration;
@@ -243,6 +225,9 @@ impl eframe::App for Imeji {
 
                             // Interpolate from start offset to zero
                             self.pan_offset = self.animation_start_offset * (1.0 - eased_t);
+
+                            // Schedule next animation frame (~60 FPS)
+                            ctx.request_repaint_after(std::time::Duration::from_millis(16));
                         }
                     }
                 }
@@ -258,6 +243,7 @@ impl eframe::App for Imeji {
                         // Only allow panning when zoom is greater than 1.0
                         if self.zoom > 1.0 {
                             self.pan_offset += delta;
+                            ctx.request_repaint();
                         }
                         self.last_mouse_pos = Some(current_pos);
                     }
