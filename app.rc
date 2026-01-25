@@ -1,8 +1,0 @@
-// app.rc
-// '1' adalah ID dari resource ikon aplikasi.
-// "icon.ico" adalah nama file ikon yang harus ada di root proyek Anda.
-1 ICON "icon.ico"
-
-// '2' adalah ID dari resource ikon filetype.
-// "icon32.ico" adalah ikon yang akan digunakan untuk file types.
-2 ICON "icon32.ico"

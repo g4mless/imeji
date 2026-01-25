@@ -1,1 +1,24 @@
-/target
+# .NET Build Outputs
+bin/
+obj/
+*.user
+*.suo
+*.cache
+
+# Visual Studio
+.vs/
+*.csproj.user
+
+# Rider
+.idea/
+
+# Build logs
+build.log
+
+# Rust (legacy)
+target/
+Cargo.lock
+
+# OS
+.DS_Store
+Thumbs.db
