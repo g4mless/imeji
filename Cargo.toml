@@ -8,9 +8,6 @@ build = "build.rs"
 name = "imeji"
 path = "src/main.rs"
 
-[target.'cfg(windows)'.bin.imeji]
-subsystem = "windows"
-
 [profile.release]
 opt-level = "z"
 lto = true
@@ -20,7 +17,7 @@ strip = true
 
 
 [dependencies]
-eframe = { version = "*", features = ["persistence"] }
+eframe = { version = "*", features = ["persistence", "wgpu"] }
 windows = { version = "0.58", features = ["Win32_Graphics_Imaging", "Win32_System_Com", "Win32_Foundation", "Win32_System_SystemServices", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_Security"] }
 argh = "*"
 

@@ -13,6 +13,7 @@ fn main() -> eframe::Result {
 
     options.persist_window = true;
     options.vsync = true;
+    options.multisampling = 4;
     
     let mut viewport_builder = egui::ViewportBuilder::default()
         .with_min_inner_size([480.0, 480.0]);
@@ -51,8 +52,8 @@ fn load_icon() -> Result<egui::IconData, Box<dyn std::error::Error>> {
 
 #[derive(Default)]
 struct Imeji {
-    image: Option<egui::ColorImage>,
-    texture: Option<egui::TextureHandle>,
+    image_levels: Vec<egui::ColorImage>,
+    textures: Vec<egui::TextureHandle>,
     filename: Option<String>,
     zoom: f32,
     pan_offset: egui::Vec2,
@@ -68,8 +69,8 @@ struct Imeji {
 impl Imeji {
     fn new() -> Self {
         Self {
-            image: None,
-            texture: None,
+            image_levels: Vec::new(),
+            textures: Vec::new(),
             filename: None,
             zoom: 1.0,
             pan_offset: egui::Vec2::ZERO,
@@ -143,8 +144,8 @@ impl eframe::App for Imeji {
 
         // Ctrl+W = Close Image
         if keyboard_shortcut {
-            self.image = None;
-            self.texture = None;
+            self.image_levels.clear();
+            self.textures.clear();
             self.filename = None;
             self.zoom = 1.0;
             self.pan_offset = egui::Vec2::ZERO;
@@ -167,18 +168,25 @@ impl eframe::App for Imeji {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE) // Remove default frame/padding
             .show(ctx, |ui| {
-            if let Some(image) = &self.image {
-                let texture = self.texture.get_or_insert_with(|| {
+            if let Some(base_image) = self.image_levels.first() {
+                if self.textures.len() != self.image_levels.len() {
                     let texture_options = egui::TextureOptions {
                         magnification: egui::TextureFilter::Linear,
                         minification: egui::TextureFilter::Linear,
                         wrap_mode: egui::TextureWrapMode::ClampToEdge,
-                        mipmap_mode: Some(egui::TextureFilter::Linear),
+                        mipmap_mode: None,
                     };
-                    ctx.load_texture("loaded_image", image.clone(), texture_options)
-                });
+                    self.textures = self
+                        .image_levels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, image)| {
+                            ctx.load_texture(format!("loaded_image_mip_{i}"), image.clone(), texture_options)
+                        })
+                        .collect();
+                }
 
-                let image_size = texture.size_vec2();
+                let base_image_size = egui::vec2(base_image.size[0] as f32, base_image.size[1] as f32);
                 let screen_rect = ctx.screen_rect();
                 // Use screen rect instead of available_size to avoid UI padding
                 let available_size = screen_rect.size();
@@ -252,21 +260,26 @@ impl eframe::App for Imeji {
                     self.last_mouse_pos = None;
                 }
 
-                let base_scale = (available_size.x / image_size.x)
-                    .min(available_size.y / image_size.y)
+                let base_scale = (available_size.x / base_image_size.x)
+                    .min(available_size.y / base_image_size.y)
                     .min(1.0);
 
-                let display_size = image_size * base_scale * self.zoom;
+                let effective_scale = base_scale * self.zoom;
+                let mip_level = pick_mip_level(effective_scale, self.textures.len());
+                let texture = &self.textures[mip_level];
+
+                let display_size = base_image_size * effective_scale;
                 let center = ui.available_rect_before_wrap().center();
                 let image_pos = center - display_size * 0.5 + self.pan_offset;
 
                 let image_rect = egui::Rect::from_min_size(image_pos, display_size);
                 let _response = ui.allocate_rect(ui.available_rect_before_wrap(), egui::Sense::click_and_drag());
+                let snapped_image_rect = snap_rect_to_pixels(image_rect, ctx.pixels_per_point());
                 
-                if ui.is_rect_visible(image_rect) {
+                if ui.is_rect_visible(snapped_image_rect) {
                     ui.painter().image(
                         texture.id(),
-                        image_rect,
+                        snapped_image_rect,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
                     );
@@ -283,12 +296,13 @@ impl Imeji {
         match wic_result {
             Ok((rgba, width, height)) => {
                 let size = [width as usize, height as usize];
-                self.image = Some(egui::ColorImage::from_rgba_unmultiplied(
+                let base_image = egui::ColorImage::from_rgba_unmultiplied(
                     size,
                     &rgba,
-                ));
+                );
+                self.image_levels = build_mip_chain(base_image);
                 self.filename = filename;
-                self.texture = None;
+                self.textures.clear();
                 // Reset zoom and pan when loading new image
                 self.zoom = 1.0;
                 self.pan_offset = egui::Vec2::ZERO;
@@ -301,4 +315,77 @@ impl Imeji {
             Err(e) => println!("ImageError : {e}"),
         }
     }
+}
+
+fn snap_rect_to_pixels(rect: egui::Rect, pixels_per_point: f32) -> egui::Rect {
+    let min = (rect.min.to_vec2() * pixels_per_point).round() / pixels_per_point;
+    let max = (rect.max.to_vec2() * pixels_per_point).round() / pixels_per_point;
+    egui::Rect::from_min_max(min.to_pos2(), max.to_pos2())
+}
+
+fn pick_mip_level(scale: f32, max_levels: usize) -> usize {
+    if max_levels <= 1 || scale >= 1.0 {
+        return 0;
+    }
+
+    let desired = (1.0 / scale).log2().floor().max(0.0) as usize;
+    desired.min(max_levels.saturating_sub(1))
+}
+
+fn build_mip_chain(base: egui::ColorImage) -> Vec<egui::ColorImage> {
+    let mut levels = vec![base];
+
+    loop {
+        let Some(prev) = levels.last() else {
+            break;
+        };
+
+        let prev_w = prev.size[0];
+        let prev_h = prev.size[1];
+        if prev_w == 1 && prev_h == 1 {
+            break;
+        }
+
+        let next_w = (prev_w / 2).max(1);
+        let next_h = (prev_h / 2).max(1);
+        let mut next_pixels = Vec::with_capacity(next_w * next_h);
+
+        for y in 0..next_h {
+            for x in 0..next_w {
+                let mut r_sum = 0u32;
+                let mut g_sum = 0u32;
+                let mut b_sum = 0u32;
+                let mut a_sum = 0u32;
+                let mut count = 0u32;
+
+                for oy in 0..2usize {
+                    for ox in 0..2usize {
+                        let sx = (x * 2 + ox).min(prev_w - 1);
+                        let sy = (y * 2 + oy).min(prev_h - 1);
+                        let p = prev.pixels[sy * prev_w + sx];
+                        r_sum += p.r() as u32;
+                        g_sum += p.g() as u32;
+                        b_sum += p.b() as u32;
+                        a_sum += p.a() as u32;
+                        count += 1;
+                    }
+                }
+
+                next_pixels.push(egui::Color32::from_rgba_unmultiplied(
+                    (r_sum / count) as u8,
+                    (g_sum / count) as u8,
+                    (b_sum / count) as u8,
+                    (a_sum / count) as u8,
+                ));
+            }
+        }
+
+        levels.push(egui::ColorImage {
+            size: [next_w, next_h],
+            pixels: next_pixels,
+            source_size: egui::vec2(next_w as f32, next_h as f32),
+        });
+    }
+
+    levels
 }
