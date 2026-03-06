@@ -2,8 +2,9 @@
 
 use argh::FromArgs;
 use eframe::egui;
-use image::GenericImageView;
 use std::path::PathBuf;
+
+mod wic;
 
 fn main() -> eframe::Result {
     let cli: Cli = argh::from_env();
@@ -39,11 +40,10 @@ fn main() -> eframe::Result {
 }
 
 fn load_icon() -> Result<egui::IconData, Box<dyn std::error::Error>> {
-    let image = image::load_from_memory(include_bytes!("../icon.ico"))?;
-    let (width, height) = image.dimensions(); // Get dimensions before conversion
-    let image_buffer = image.to_rgba8();
+    let wic = wic::WicContext::new()?;
+    let (rgba, width, height) = wic.load_from_memory(include_bytes!("../icon.ico"))?;
     Ok(egui::IconData {
-        rgba: image_buffer.into_raw(),
+        rgba,
         width,
         height,
     })
@@ -279,13 +279,13 @@ impl eframe::App for Imeji {
 
 impl Imeji {
     fn load_image(&mut self, bytes: &[u8], filename: Option<String>) {
-        match image::load_from_memory(bytes) {
-            Ok(dynamic_image) => {
-                let rgba_image = dynamic_image.to_rgba8();
-                let size = [rgba_image.width() as usize, rgba_image.height() as usize];
+        let wic_result = wic::WicContext::new().and_then(|w| w.load_from_memory(bytes));
+        match wic_result {
+            Ok((rgba, width, height)) => {
+                let size = [width as usize, height as usize];
                 self.image = Some(egui::ColorImage::from_rgba_unmultiplied(
                     size,
-                    &rgba_image,
+                    &rgba,
                 ));
                 self.filename = filename;
                 self.texture = None;
