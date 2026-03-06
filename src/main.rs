@@ -335,6 +335,11 @@ fn pick_mip_level(scale: f32, max_levels: usize) -> usize {
 fn build_mip_chain(base: egui::ColorImage) -> Vec<egui::ColorImage> {
     let mut levels = vec![base];
 
+    let mut srgb_to_linear_lut = [0u16; 256];
+    for (i, v) in srgb_to_linear_lut.iter_mut().enumerate() {
+        *v = srgb_u8_to_linear_u16(i as u8);
+    }
+
     loop {
         let Some(prev) = levels.last() else {
             break;
@@ -350,6 +355,7 @@ fn build_mip_chain(base: egui::ColorImage) -> Vec<egui::ColorImage> {
         let next_h = (prev_h / 2).max(1);
         let mut next_pixels = Vec::with_capacity(next_w * next_h);
 
+        // Fast 2x2 mip generation, but average colors in linear space (gamma-correct).
         for y in 0..next_h {
             for x in 0..next_w {
                 let mut r_sum = 0u32;
@@ -363,18 +369,18 @@ fn build_mip_chain(base: egui::ColorImage) -> Vec<egui::ColorImage> {
                         let sx = (x * 2 + ox).min(prev_w - 1);
                         let sy = (y * 2 + oy).min(prev_h - 1);
                         let p = prev.pixels[sy * prev_w + sx];
-                        r_sum += p.r() as u32;
-                        g_sum += p.g() as u32;
-                        b_sum += p.b() as u32;
+                        r_sum += srgb_to_linear_lut[p.r() as usize] as u32;
+                        g_sum += srgb_to_linear_lut[p.g() as usize] as u32;
+                        b_sum += srgb_to_linear_lut[p.b() as usize] as u32;
                         a_sum += p.a() as u32;
                         count += 1;
                     }
                 }
 
                 next_pixels.push(egui::Color32::from_rgba_unmultiplied(
-                    (r_sum / count) as u8,
-                    (g_sum / count) as u8,
-                    (b_sum / count) as u8,
+                    linear_u16_to_srgb_u8((r_sum / count) as u16),
+                    linear_u16_to_srgb_u8((g_sum / count) as u16),
+                    linear_u16_to_srgb_u8((b_sum / count) as u16),
                     (a_sum / count) as u8,
                 ));
             }
@@ -388,4 +394,24 @@ fn build_mip_chain(base: egui::ColorImage) -> Vec<egui::ColorImage> {
     }
 
     levels
+}
+
+fn srgb_u8_to_linear_u16(v: u8) -> u16 {
+    let srgb = (v as f32) / 255.0;
+    let linear = if srgb <= 0.04045 {
+        srgb / 12.92
+    } else {
+        ((srgb + 0.055) / 1.055).powf(2.4)
+    };
+    (linear.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16
+}
+
+fn linear_u16_to_srgb_u8(v: u16) -> u8 {
+    let linear = (v as f32) / 65535.0;
+    let srgb = if linear <= 0.0031308 {
+        linear * 12.92
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    };
+    (srgb.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
 }
