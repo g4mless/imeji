@@ -64,6 +64,7 @@ fn load_icon() -> Result<egui::IconData, Box<dyn std::error::Error>> {
 #[derive(Default)]
 struct Imeji {
     image_levels: Vec<egui::ColorImage>,
+    base_image_size: Option<egui::Vec2>,
     textures: Vec<egui::TextureHandle>,
     filename: Option<String>,
     zoom: f32,
@@ -82,6 +83,7 @@ impl Imeji {
     fn new() -> Self {
         Self {
             image_levels: Vec::new(),
+            base_image_size: None,
             textures: Vec::new(),
             filename: None,
             zoom: 1.0,
@@ -185,6 +187,7 @@ impl eframe::App for Imeji {
         // Ctrl+W = Close Image
         if keyboard_shortcut {
             self.image_levels.clear();
+            self.base_image_size = None;
             self.textures.clear();
             self.filename = None;
             self.zoom = 1.0;
@@ -209,30 +212,29 @@ impl eframe::App for Imeji {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE) // Remove default frame/padding
             .show(ctx, |ui| {
-                if let Some(base_image) = self.image_levels.first() {
-                    if self.textures.len() != self.image_levels.len() {
+                if let Some(base_image_size) = self.base_image_size {
+                    if self.textures.len() != self.image_levels.len() && !self.image_levels.is_empty()
+                    {
                         let texture_options = egui::TextureOptions {
                             magnification: egui::TextureFilter::Linear,
                             minification: egui::TextureFilter::Linear,
                             wrap_mode: egui::TextureWrapMode::ClampToEdge,
                             mipmap_mode: None,
                         };
-                        self.textures = self
-                            .image_levels
-                            .iter()
+                        let levels = std::mem::take(&mut self.image_levels);
+                        self.textures = levels
+                            .into_iter()
                             .enumerate()
                             .map(|(i, image)| {
                                 ctx.load_texture(
                                     format!("loaded_image_mip_{i}"),
-                                    image.clone(),
+                                    image,
                                     texture_options,
                                 )
                             })
                             .collect();
                     }
 
-                    let base_image_size =
-                        egui::vec2(base_image.size[0] as f32, base_image.size[1] as f32);
                     let screen_rect = ctx.screen_rect();
                     // Use screen rect instead of available_size to avoid UI padding
                     let available_size = screen_rect.size();
@@ -356,6 +358,7 @@ impl Imeji {
                 let size = [width as usize, height as usize];
                 let base_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
                 self.image_levels = build_mip_chain(base_image);
+                self.base_image_size = Some(egui::vec2(width as f32, height as f32));
                 self.filename = filename;
                 self.textures.clear();
                 // Reset zoom and pan when loading new image
