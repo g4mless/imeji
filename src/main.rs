@@ -29,21 +29,9 @@ fn main() -> eframe::Result {
         Box::new(move |_| {
             let mut app = Imeji::new();
             if let Some(p) = initial_path {
-                let filename = p.file_name().map(|n| n.to_string_lossy().to_string());
-                match std::fs::read(&p) {
-                    Ok(bytes) => {
-                        if let Err(err) = app.load_image(&bytes, filename.clone()) {
-                            app.last_error =
-                                Some(format_load_error(Some(&p), filename.as_deref(), &err));
-                        }
-                    }
-                    Err(err) => {
-                        app.last_error = Some(format_load_error(
-                            Some(&p),
-                            filename.as_deref(),
-                            &err.to_string(),
-                        ));
-                    }
+                if let Err(err) = app.load_image_from_path(&p) {
+                    let filename = p.file_name().map(|n| n.to_string_lossy().to_string());
+                    app.last_error = Some(format_load_error(Some(&p), filename.as_deref(), &err));
                 }
             }
             Ok(Box::new(app))
@@ -67,6 +55,7 @@ struct Imeji {
     base_image_size: Option<egui::Vec2>,
     textures: Vec<egui::TextureHandle>,
     filename: Option<String>,
+    current_path: Option<PathBuf>,
     zoom: f32,
     pan_offset: egui::Vec2,
     is_dragging: bool,
@@ -86,6 +75,7 @@ impl Imeji {
             base_image_size: None,
             textures: Vec::new(),
             filename: None,
+            current_path: None,
             zoom: 1.0,
             pan_offset: egui::Vec2::ZERO,
             is_dragging: false,
@@ -140,6 +130,10 @@ impl eframe::App for Imeji {
                 egui::Key::W,
             ))
         });
+        let nav_prev =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft));
+        let nav_next =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight));
 
         // Update window title when it changes
         let title = self.filename.as_deref().unwrap_or("Imeji");
@@ -170,20 +164,8 @@ impl eframe::App for Imeji {
                 }
                 ctx.request_repaint();
             } else if let Some(path) = &dropped_file.path {
-                match std::fs::read(path) {
-                    Ok(bytes) => {
-                        if let Err(err) = self.load_image(&bytes, filename.clone()) {
-                            self.last_error =
-                                Some(format_load_error(Some(path), filename.as_deref(), &err));
-                        }
-                    }
-                    Err(err) => {
-                        self.last_error = Some(format_load_error(
-                            Some(path),
-                            filename.as_deref(),
-                            &err.to_string(),
-                        ));
-                    }
+                if let Err(err) = self.load_image_from_path(path) {
+                    self.last_error = Some(format_load_error(Some(path), filename.as_deref(), &err));
                 }
                 ctx.request_repaint();
             }
@@ -195,9 +177,22 @@ impl eframe::App for Imeji {
             self.base_image_size = None;
             self.textures.clear();
             self.filename = None;
+            self.current_path = None;
             self.zoom = 1.0;
             self.pan_offset = egui::Vec2::ZERO;
             self.last_error = None;
+        }
+
+        if nav_prev {
+            if let Err(err) = self.load_adjacent_image(-1) {
+                self.last_error = Some(err);
+            }
+            ctx.request_repaint();
+        } else if nav_next {
+            if let Err(err) = self.load_adjacent_image(1) {
+                self.last_error = Some(err);
+            }
+            ctx.request_repaint();
         }
 
         let current_window_size = ctx.screen_rect().size();
@@ -372,6 +367,7 @@ impl Imeji {
                 self.image_levels = build_mip_chain(base_image);
                 self.base_image_size = Some(egui::vec2(width as f32, height as f32));
                 self.filename = filename;
+                self.current_path = None;
                 self.textures.clear();
                 // Reset zoom and pan when loading new image
                 self.zoom = 1.0;
@@ -387,6 +383,80 @@ impl Imeji {
             Err(e) => Err(e),
         }
     }
+
+    fn load_image_from_path(&mut self, path: &Path) -> Result<(), String> {
+        let filename = path.file_name().map(|n| n.to_string_lossy().to_string());
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        self.load_image(&bytes, filename)?;
+        self.current_path = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    fn load_adjacent_image(&mut self, direction: isize) -> Result<(), String> {
+        let Some(current_path) = self.current_path.clone() else {
+            return Ok(());
+        };
+        if direction == 0 {
+            return Ok(());
+        }
+
+        let parent = current_path
+            .parent()
+            .ok_or_else(|| "Current image has no parent directory".to_string())?;
+
+        let mut files: Vec<PathBuf> = std::fs::read_dir(parent)
+            .map_err(|e| e.to_string())?
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.is_file() && is_supported_image(path))
+            .collect();
+
+        files.sort_by_key(|path| {
+            path.file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default()
+        });
+
+        let Some(current_idx) = files.iter().position(|p| p == &current_path) else {
+            return Ok(());
+        };
+
+        let next_idx = if direction > 0 {
+            current_idx + 1
+        } else if current_idx == 0 {
+            return Ok(());
+        } else {
+            current_idx - 1
+        };
+
+        let Some(next_path) = files.get(next_idx) else {
+            return Ok(());
+        };
+
+        self.load_image_from_path(next_path).map_err(|e| {
+            let filename = next_path.file_name().map(|n| n.to_string_lossy().to_string());
+            format_load_error(Some(next_path), filename.as_deref(), &e)
+        })
+    }
+}
+
+fn is_supported_image(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("jpg")
+            | Some("jpeg")
+            | Some("png")
+            | Some("bmp")
+            | Some("gif")
+            | Some("webp")
+            | Some("tif")
+            | Some("tiff")
+            | Some("ico")
+            | Some("jxl")
+            | Some("avif")
+    )
 }
 
 fn format_load_error(path: Option<&Path>, filename: Option<&str>, error: &str) -> String {
