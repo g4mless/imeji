@@ -2,21 +2,20 @@
 
 use argh::FromArgs;
 use eframe::egui;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod wic;
 
 fn main() -> eframe::Result {
     let cli: Cli = argh::from_env();
     let mut options = eframe::NativeOptions::default();
-    let initial_path = cli.file.map(|s| PathBuf::from(s));
+    let initial_path = cli.file.map(PathBuf::from);
 
     options.persist_window = true;
     options.vsync = true;
     options.multisampling = 4;
-    
-    let mut viewport_builder = egui::ViewportBuilder::default()
-        .with_min_inner_size([480.0, 480.0]);
+
+    let mut viewport_builder = egui::ViewportBuilder::default().with_min_inner_size([480.0, 480.0]);
 
     if let Ok(icon) = load_icon() {
         viewport_builder = viewport_builder.with_icon(icon);
@@ -30,9 +29,21 @@ fn main() -> eframe::Result {
         Box::new(move |_| {
             let mut app = Imeji::new();
             if let Some(p) = initial_path {
-                if let Ok(bytes) = std::fs::read(&p) {
-                    let filename = p.file_name().map(|n| n.to_string_lossy().to_string());
-                    app.load_image(&bytes, filename);
+                let filename = p.file_name().map(|n| n.to_string_lossy().to_string());
+                match std::fs::read(&p) {
+                    Ok(bytes) => {
+                        if let Err(err) = app.load_image(&bytes, filename.clone()) {
+                            app.last_error =
+                                Some(format_load_error(Some(&p), filename.as_deref(), &err));
+                        }
+                    }
+                    Err(err) => {
+                        app.last_error = Some(format_load_error(
+                            Some(&p),
+                            filename.as_deref(),
+                            &err.to_string(),
+                        ));
+                    }
                 }
             }
             Ok(Box::new(app))
@@ -64,6 +75,7 @@ struct Imeji {
     animation_start_offset: egui::Vec2,
     animation_start_time: Option<std::time::Instant>,
     last_title: Option<String>,
+    last_error: Option<String>,
 }
 
 impl Imeji {
@@ -81,6 +93,7 @@ impl Imeji {
             animation_start_offset: egui::Vec2::ZERO,
             animation_start_time: None,
             last_title: None,
+            last_error: None,
         }
     }
 }
@@ -103,7 +116,12 @@ impl eframe::App for Imeji {
             let mouse_pos = i.pointer.hover_pos();
             let is_primary_down = i.pointer.primary_down();
 
-            (dropped_files, smooth_scroll_delta, mouse_pos, is_primary_down)
+            (
+                dropped_files,
+                smooth_scroll_delta,
+                mouse_pos,
+                is_primary_down,
+            )
         });
 
         let (dropped_files, smooth_scroll_delta, mouse_pos, is_primary_down) = input;
@@ -126,19 +144,41 @@ impl eframe::App for Imeji {
         // Handle dropped files
         if !dropped_files.is_empty() {
             let dropped_file = &dropped_files[0];
-            let filename = dropped_file.path.as_ref()
+            let filename = dropped_file
+                .path
+                .as_ref()
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().to_string())
-                .or_else(|| if dropped_file.name.is_empty() { None } else { Some(dropped_file.name.clone()) });
+                .or_else(|| {
+                    if dropped_file.name.is_empty() {
+                        None
+                    } else {
+                        Some(dropped_file.name.clone())
+                    }
+                });
 
             if let Some(bytes) = &dropped_file.bytes {
-                self.load_image(bytes, filename);
+                if let Err(err) = self.load_image(bytes, filename.clone()) {
+                    self.last_error = Some(format_load_error(None, filename.as_deref(), &err));
+                }
                 ctx.request_repaint();
             } else if let Some(path) = &dropped_file.path {
-                if let Ok(bytes) = std::fs::read(path) {
-                    self.load_image(&bytes, filename);
-                    ctx.request_repaint();
+                match std::fs::read(path) {
+                    Ok(bytes) => {
+                        if let Err(err) = self.load_image(&bytes, filename.clone()) {
+                            self.last_error =
+                                Some(format_load_error(Some(path), filename.as_deref(), &err));
+                        }
+                    }
+                    Err(err) => {
+                        self.last_error = Some(format_load_error(
+                            Some(path),
+                            filename.as_deref(),
+                            &err.to_string(),
+                        ));
+                    }
                 }
+                ctx.request_repaint();
             }
         }
 
@@ -149,6 +189,7 @@ impl eframe::App for Imeji {
             self.filename = None;
             self.zoom = 1.0;
             self.pan_offset = egui::Vec2::ZERO;
+            self.last_error = None;
         }
 
         let current_window_size = ctx.screen_rect().size();
@@ -168,59 +209,65 @@ impl eframe::App for Imeji {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE) // Remove default frame/padding
             .show(ctx, |ui| {
-            if let Some(base_image) = self.image_levels.first() {
-                if self.textures.len() != self.image_levels.len() {
-                    let texture_options = egui::TextureOptions {
-                        magnification: egui::TextureFilter::Linear,
-                        minification: egui::TextureFilter::Linear,
-                        wrap_mode: egui::TextureWrapMode::ClampToEdge,
-                        mipmap_mode: None,
-                    };
-                    self.textures = self
-                        .image_levels
-                        .iter()
-                        .enumerate()
-                        .map(|(i, image)| {
-                            ctx.load_texture(format!("loaded_image_mip_{i}"), image.clone(), texture_options)
-                        })
-                        .collect();
-                }
-
-                let base_image_size = egui::vec2(base_image.size[0] as f32, base_image.size[1] as f32);
-                let screen_rect = ctx.screen_rect();
-                // Use screen rect instead of available_size to avoid UI padding
-                let available_size = screen_rect.size();
-
-                if smooth_scroll_delta != 0.0 {
-                    let zoom_factor = 1.0 + smooth_scroll_delta * 0.001;
-                    let old_zoom = self.zoom;
-                    self.zoom = (self.zoom * zoom_factor).clamp(1.0, 10.0);
-
-                    // Start animation to center when zoom reaches 1.0
-                    if self.zoom == 1.0 && old_zoom > 1.0 {
-                        self.is_animating_to_center = true;
-                        self.animation_start_offset = self.pan_offset;
-                        self.animation_start_time = Some(std::time::Instant::now());
-                    } else if self.zoom > 1.0 {
-                        // Stop animation if zooming back in
-                        self.is_animating_to_center = false;
-                        if let Some(current_mouse_pos) = mouse_pos {
-                            let center = screen_rect.center();
-                            let mouse_offset = current_mouse_pos - center;
-                            let zoom_change = self.zoom / old_zoom - 1.0;
-                            self.pan_offset -= mouse_offset * zoom_change;
-                        }
+                if let Some(base_image) = self.image_levels.first() {
+                    if self.textures.len() != self.image_levels.len() {
+                        let texture_options = egui::TextureOptions {
+                            magnification: egui::TextureFilter::Linear,
+                            minification: egui::TextureFilter::Linear,
+                            wrap_mode: egui::TextureWrapMode::ClampToEdge,
+                            mipmap_mode: None,
+                        };
+                        self.textures = self
+                            .image_levels
+                            .iter()
+                            .enumerate()
+                            .map(|(i, image)| {
+                                ctx.load_texture(
+                                    format!("loaded_image_mip_{i}"),
+                                    image.clone(),
+                                    texture_options,
+                                )
+                            })
+                            .collect();
                     }
 
-                    ctx.request_repaint();
-                }
+                    let base_image_size =
+                        egui::vec2(base_image.size[0] as f32, base_image.size[1] as f32);
+                    let screen_rect = ctx.screen_rect();
+                    // Use screen rect instead of available_size to avoid UI padding
+                    let available_size = screen_rect.size();
 
-                // Handle animation to center
-                if self.is_animating_to_center {
-                    if let Some(start_time) = self.animation_start_time {
+                    if smooth_scroll_delta != 0.0 {
+                        let zoom_factor = 1.0 + smooth_scroll_delta * 0.001;
+                        let old_zoom = self.zoom;
+                        self.zoom = (self.zoom * zoom_factor).clamp(1.0, 10.0);
+
+                        // Start animation to center when zoom reaches 1.0
+                        if self.zoom == 1.0 && old_zoom > 1.0 {
+                            self.is_animating_to_center = true;
+                            self.animation_start_offset = self.pan_offset;
+                            self.animation_start_time = Some(std::time::Instant::now());
+                        } else if self.zoom > 1.0 {
+                            // Stop animation if zooming back in
+                            self.is_animating_to_center = false;
+                            if let Some(current_mouse_pos) = mouse_pos {
+                                let center = screen_rect.center();
+                                let mouse_offset = current_mouse_pos - center;
+                                let zoom_change = self.zoom / old_zoom - 1.0;
+                                self.pan_offset -= mouse_offset * zoom_change;
+                            }
+                        }
+
+                        ctx.request_repaint();
+                    }
+
+                    // Handle animation to center
+                    if self.is_animating_to_center
+                        && let Some(start_time) = self.animation_start_time
+                    {
                         let elapsed = start_time.elapsed().as_secs_f32();
                         let animation_duration = 0.3; // 300ms animation
-                        
+
                         if elapsed >= animation_duration {
                             // Animation complete
                             self.pan_offset = egui::Vec2::ZERO;
@@ -238,68 +285,76 @@ impl eframe::App for Imeji {
                             ctx.request_repaint_after(std::time::Duration::from_millis(16));
                         }
                     }
-                }
 
-                if is_primary_down && mouse_pos.is_some() {
-                    let current_pos = mouse_pos.unwrap();
-
-                    if !self.is_dragging {
-                        self.is_dragging = true;
-                        self.last_mouse_pos = Some(current_pos);
-                    } else if let Some(last_pos) = self.last_mouse_pos {
-                        let delta = current_pos - last_pos;
-                        // Only allow panning when zoom is greater than 1.0
-                        if self.zoom > 1.0 {
-                            self.pan_offset += delta;
-                            ctx.request_repaint();
+                    if let Some(current_pos) = mouse_pos.filter(|_| is_primary_down) {
+                        if !self.is_dragging {
+                            self.is_dragging = true;
+                            self.last_mouse_pos = Some(current_pos);
+                        } else if let Some(last_pos) = self.last_mouse_pos {
+                            let delta = current_pos - last_pos;
+                            // Only allow panning when zoom is greater than 1.0
+                            if self.zoom > 1.0 {
+                                self.pan_offset += delta;
+                                ctx.request_repaint();
+                            }
+                            self.last_mouse_pos = Some(current_pos);
                         }
-                        self.last_mouse_pos = Some(current_pos);
+                    } else {
+                        self.is_dragging = false;
+                        self.last_mouse_pos = None;
                     }
-                } else {
-                    self.is_dragging = false;
-                    self.last_mouse_pos = None;
-                }
 
-                let base_scale = (available_size.x / base_image_size.x)
-                    .min(available_size.y / base_image_size.y)
-                    .min(1.0);
+                    let base_scale = (available_size.x / base_image_size.x)
+                        .min(available_size.y / base_image_size.y)
+                        .min(1.0);
 
-                let effective_scale = base_scale * self.zoom;
-                let mip_level = pick_mip_level(effective_scale, self.textures.len());
-                let texture = &self.textures[mip_level];
+                    let effective_scale = base_scale * self.zoom;
+                    let mip_level = pick_mip_level(effective_scale, self.textures.len());
+                    let texture = &self.textures[mip_level];
 
-                let display_size = base_image_size * effective_scale;
-                let center = ui.available_rect_before_wrap().center();
-                let image_pos = center - display_size * 0.5 + self.pan_offset;
+                    let display_size = base_image_size * effective_scale;
+                    let center = ui.available_rect_before_wrap().center();
+                    let image_pos = center - display_size * 0.5 + self.pan_offset;
 
-                let image_rect = egui::Rect::from_min_size(image_pos, display_size);
-                let _response = ui.allocate_rect(ui.available_rect_before_wrap(), egui::Sense::click_and_drag());
-                let snapped_image_rect = snap_rect_to_pixels(image_rect, ctx.pixels_per_point());
-                
-                if ui.is_rect_visible(snapped_image_rect) {
-                    ui.painter().image(
-                        texture.id(),
-                        snapped_image_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
+                    let image_rect = egui::Rect::from_min_size(image_pos, display_size);
+                    let _response = ui.allocate_rect(
+                        ui.available_rect_before_wrap(),
+                        egui::Sense::click_and_drag(),
                     );
-                }
+                    let snapped_image_rect =
+                        snap_rect_to_pixels(image_rect, ctx.pixels_per_point());
 
-            }
-        });
+                    if ui.is_rect_visible(snapped_image_rect) {
+                        ui.painter().image(
+                            texture.id(),
+                            snapped_image_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
+            });
+
+        if let Some(error) = self.last_error.as_deref() {
+            egui::Area::new("load_error".into())
+                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 16.0))
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_max_width(520.0);
+                        ui.colored_label(egui::Color32::from_rgb(196, 64, 64), error);
+                    });
+                });
+        }
     }
 }
 
 impl Imeji {
-    fn load_image(&mut self, bytes: &[u8], filename: Option<String>) {
+    fn load_image(&mut self, bytes: &[u8], filename: Option<String>) -> Result<(), String> {
         let wic_result = wic::WicContext::new().and_then(|w| w.load_from_memory(bytes));
         match wic_result {
             Ok((rgba, width, height)) => {
                 let size = [width as usize, height as usize];
-                let base_image = egui::ColorImage::from_rgba_unmultiplied(
-                    size,
-                    &rgba,
-                );
+                let base_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
                 self.image_levels = build_mip_chain(base_image);
                 self.filename = filename;
                 self.textures.clear();
@@ -311,10 +366,20 @@ impl Imeji {
                 self.last_window_size = None;
                 self.is_animating_to_center = false;
                 self.animation_start_time = None;
+                self.last_error = None;
+                Ok(())
             }
-            Err(e) => println!("ImageError : {e}"),
+            Err(e) => Err(e),
         }
     }
+}
+
+fn format_load_error(path: Option<&Path>, filename: Option<&str>, error: &str) -> String {
+    let target = path
+        .map(|p| p.display().to_string())
+        .or_else(|| filename.map(ToOwned::to_owned))
+        .unwrap_or_else(|| "image".to_string());
+    format!("Failed to open {target}: {error}")
 }
 
 fn snap_rect_to_pixels(rect: egui::Rect, pixels_per_point: f32) -> egui::Rect {
@@ -358,30 +423,41 @@ fn build_mip_chain(base: egui::ColorImage) -> Vec<egui::ColorImage> {
         // Fast 2x2 mip generation, but average colors in linear space (gamma-correct).
         for y in 0..next_h {
             for x in 0..next_w {
-                let mut r_sum = 0u32;
-                let mut g_sum = 0u32;
-                let mut b_sum = 0u32;
-                let mut a_sum = 0u32;
-                let mut count = 0u32;
+                let mut r_sum = 0u64;
+                let mut g_sum = 0u64;
+                let mut b_sum = 0u64;
+                let mut alpha_sum = 0u64;
+                let mut count = 0u64;
 
                 for oy in 0..2usize {
                     for ox in 0..2usize {
                         let sx = (x * 2 + ox).min(prev_w - 1);
                         let sy = (y * 2 + oy).min(prev_h - 1);
                         let p = prev.pixels[sy * prev_w + sx];
-                        r_sum += srgb_to_linear_lut[p.r() as usize] as u32;
-                        g_sum += srgb_to_linear_lut[p.g() as usize] as u32;
-                        b_sum += srgb_to_linear_lut[p.b() as usize] as u32;
-                        a_sum += p.a() as u32;
+                        let alpha = p.a() as u64;
+                        r_sum += srgb_to_linear_lut[p.r() as usize] as u64 * alpha;
+                        g_sum += srgb_to_linear_lut[p.g() as usize] as u64 * alpha;
+                        b_sum += srgb_to_linear_lut[p.b() as usize] as u64 * alpha;
+                        alpha_sum += alpha;
                         count += 1;
                     }
                 }
 
+                let (r, g, b) = if alpha_sum == 0 {
+                    (0, 0, 0)
+                } else {
+                    (
+                        linear_u16_to_srgb_u8((r_sum / alpha_sum) as u16),
+                        linear_u16_to_srgb_u8((g_sum / alpha_sum) as u16),
+                        linear_u16_to_srgb_u8((b_sum / alpha_sum) as u16),
+                    )
+                };
+
                 next_pixels.push(egui::Color32::from_rgba_unmultiplied(
-                    linear_u16_to_srgb_u8((r_sum / count) as u16),
-                    linear_u16_to_srgb_u8((g_sum / count) as u16),
-                    linear_u16_to_srgb_u8((b_sum / count) as u16),
-                    (a_sum / count) as u8,
+                    r,
+                    g,
+                    b,
+                    (alpha_sum / count) as u8,
                 ));
             }
         }
