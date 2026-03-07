@@ -115,18 +115,23 @@ impl eframe::App for Imeji {
         let input = ctx.input(|i| {
             let dropped_files = i.raw.dropped_files.clone();
             let smooth_scroll_delta = i.smooth_scroll_delta.y;
+            let zoom_delta = i.zoom_delta();
             let mouse_pos = i.pointer.hover_pos();
             let is_primary_down = i.pointer.primary_down();
+            let ctrl_down = i.modifiers.ctrl;
 
             (
                 dropped_files,
                 smooth_scroll_delta,
+                zoom_delta,
                 mouse_pos,
                 is_primary_down,
+                ctrl_down,
             )
         });
 
-        let (dropped_files, smooth_scroll_delta, mouse_pos, is_primary_down) = input;
+        let (dropped_files, smooth_scroll_delta, zoom_delta, mouse_pos, is_primary_down, ctrl_down) =
+            input;
 
         // Handle keyboard shortcut separately (needs mutable access)
         let keyboard_shortcut = ctx.input_mut(|i| {
@@ -239,8 +244,15 @@ impl eframe::App for Imeji {
                     // Use screen rect instead of available_size to avoid UI padding
                     let available_size = screen_rect.size();
 
-                    if smooth_scroll_delta != 0.0 {
-                        let zoom_factor = 1.0 + smooth_scroll_delta * 0.001;
+                    let mut zoom_factor = 1.0;
+                    if (zoom_delta - 1.0).abs() > f32::EPSILON {
+                        zoom_factor = zoom_delta;
+                    } else if ctrl_down && smooth_scroll_delta != 0.0 {
+                        // Keep Ctrl+wheel zoom as a desktop fallback without hijacking normal scroll.
+                        zoom_factor = 1.0 + smooth_scroll_delta * 0.001;
+                    }
+
+                    if (zoom_factor - 1.0).abs() > f32::EPSILON {
                         let old_zoom = self.zoom;
                         self.zoom = (self.zoom * zoom_factor).clamp(1.0, 10.0);
 
