@@ -13,7 +13,7 @@ fn main() -> eframe::Result {
 
     options.persist_window = true;
     options.vsync = true;
-    options.multisampling = 4;
+    options.multisampling = 0;
 
     let mut viewport_builder = egui::ViewportBuilder::default().with_min_inner_size([480.0, 480.0]);
 
