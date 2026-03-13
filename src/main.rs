@@ -3,6 +3,7 @@
 use argh::FromArgs;
 use eframe::egui;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 mod wic;
 
@@ -49,13 +50,16 @@ fn load_icon() -> Result<egui::IconData, Box<dyn std::error::Error>> {
     })
 }
 
-#[derive(Default)]
 struct Imeji {
+    wic: Option<wic::WicContext>,
     image_levels: Vec<egui::ColorImage>,
     base_image_size: Option<egui::Vec2>,
     textures: Vec<egui::TextureHandle>,
     filename: Option<String>,
     current_path: Option<PathBuf>,
+    current_dir_images: Vec<PathBuf>,
+    current_dir_index: Option<usize>,
+    current_dir_parent: Option<PathBuf>,
     zoom: f32,
     pan_offset: egui::Vec2,
     is_dragging: bool,
@@ -71,11 +75,15 @@ struct Imeji {
 impl Imeji {
     fn new() -> Self {
         Self {
+            wic: None,
             image_levels: Vec::new(),
             base_image_size: None,
             textures: Vec::new(),
             filename: None,
             current_path: None,
+            current_dir_images: Vec::new(),
+            current_dir_index: None,
+            current_dir_parent: None,
             zoom: 1.0,
             pan_offset: egui::Vec2::ZERO,
             is_dragging: false,
@@ -161,11 +169,17 @@ impl eframe::App for Imeji {
             if let Some(bytes) = &dropped_file.bytes {
                 if let Err(err) = self.load_image(bytes, filename.clone()) {
                     self.last_error = Some(format_load_error(None, filename.as_deref(), &err));
+                } else {
+                    self.current_path = None;
+                    self.current_dir_images.clear();
+                    self.current_dir_index = None;
+                    self.current_dir_parent = None;
                 }
                 ctx.request_repaint();
             } else if let Some(path) = &dropped_file.path {
                 if let Err(err) = self.load_image_from_path(path) {
-                    self.last_error = Some(format_load_error(Some(path), filename.as_deref(), &err));
+                    self.last_error =
+                        Some(format_load_error(Some(path), filename.as_deref(), &err));
                 }
                 ctx.request_repaint();
             }
@@ -178,6 +192,9 @@ impl eframe::App for Imeji {
             self.textures.clear();
             self.filename = None;
             self.current_path = None;
+            self.current_dir_images.clear();
+            self.current_dir_index = None;
+            self.current_dir_parent = None;
             self.zoom = 1.0;
             self.pan_offset = egui::Vec2::ZERO;
             self.last_error = None;
@@ -213,7 +230,8 @@ impl eframe::App for Imeji {
             .frame(egui::Frame::NONE) // Remove default frame/padding
             .show(ctx, |ui| {
                 if let Some(base_image_size) = self.base_image_size {
-                    if self.textures.len() != self.image_levels.len() && !self.image_levels.is_empty()
+                    if self.textures.len() != self.image_levels.len()
+                        && !self.image_levels.is_empty()
                     {
                         let texture_options = egui::TextureOptions {
                             magnification: egui::TextureFilter::Linear,
@@ -358,8 +376,41 @@ impl eframe::App for Imeji {
 }
 
 impl Imeji {
+    fn refresh_current_dir_cache(&mut self, path: &Path) -> Result<(), String> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| "Current image has no parent directory".to_string())?;
+
+        let mut files: Vec<PathBuf> = std::fs::read_dir(parent)
+            .map_err(|e| e.to_string())?
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|candidate| candidate.is_file() && is_supported_image(candidate))
+            .collect();
+
+        files.sort_by_key(|candidate| {
+            candidate
+                .file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default()
+        });
+
+        self.current_dir_index = files.iter().position(|p| p == path);
+        self.current_dir_parent = Some(parent.to_path_buf());
+        self.current_dir_images = files;
+        Ok(())
+    }
+
+    fn wic_context(&mut self) -> Result<&wic::WicContext, String> {
+        if self.wic.is_none() {
+            self.wic = Some(wic::WicContext::new()?);
+        }
+        self.wic
+            .as_ref()
+            .ok_or_else(|| "Failed to initialize image decoder".to_string())
+    }
+
     fn load_image(&mut self, bytes: &[u8], filename: Option<String>) -> Result<(), String> {
-        let wic_result = wic::WicContext::new().and_then(|w| w.load_from_memory(bytes));
+        let wic_result = self.wic_context().and_then(|w| w.load_from_memory(bytes));
         match wic_result {
             Ok((rgba, width, height)) => {
                 let size = [width as usize, height as usize];
@@ -367,7 +418,6 @@ impl Imeji {
                 self.image_levels = build_mip_chain(base_image);
                 self.base_image_size = Some(egui::vec2(width as f32, height as f32));
                 self.filename = filename;
-                self.current_path = None;
                 self.textures.clear();
                 // Reset zoom and pan when loading new image
                 self.zoom = 1.0;
@@ -384,39 +434,43 @@ impl Imeji {
         }
     }
 
-    fn load_image_from_path(&mut self, path: &Path) -> Result<(), String> {
+    fn load_image_from_path_impl(
+        &mut self,
+        path: &Path,
+        refresh_cache: bool,
+    ) -> Result<(), String> {
         let filename = path.file_name().map(|n| n.to_string_lossy().to_string());
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
         self.load_image(&bytes, filename)?;
         self.current_path = Some(path.to_path_buf());
+        if refresh_cache {
+            self.refresh_current_dir_cache(path)?;
+        }
+        Ok(())
+    }
+
+    fn load_image_from_path(&mut self, path: &Path) -> Result<(), String> {
+        self.load_image_from_path_impl(path, true)?;
         Ok(())
     }
 
     fn load_adjacent_image(&mut self, direction: isize) -> Result<(), String> {
-        let Some(current_path) = self.current_path.clone() else {
+        let Some(current_path) = self.current_path.as_ref().cloned() else {
             return Ok(());
         };
         if direction == 0 {
             return Ok(());
         }
 
-        let parent = current_path
-            .parent()
-            .ok_or_else(|| "Current image has no parent directory".to_string())?;
+        let expected_parent = current_path.parent().map(Path::to_path_buf);
+        if self.current_dir_images.is_empty()
+            || self.current_dir_parent != expected_parent
+            || self.current_dir_index.is_none()
+        {
+            self.refresh_current_dir_cache(&current_path)?;
+        }
 
-        let mut files: Vec<PathBuf> = std::fs::read_dir(parent)
-            .map_err(|e| e.to_string())?
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .filter(|path| path.is_file() && is_supported_image(path))
-            .collect();
-
-        files.sort_by_key(|path| {
-            path.file_name()
-                .map(|n| n.to_string_lossy().to_lowercase())
-                .unwrap_or_default()
-        });
-
-        let Some(current_idx) = files.iter().position(|p| p == &current_path) else {
+        let Some(current_idx) = self.current_dir_index else {
             return Ok(());
         };
 
@@ -428,14 +482,18 @@ impl Imeji {
             current_idx - 1
         };
 
-        let Some(next_path) = files.get(next_idx) else {
+        let Some(next_path) = self.current_dir_images.get(next_idx).cloned() else {
             return Ok(());
         };
+        self.current_dir_index = Some(next_idx);
 
-        self.load_image_from_path(next_path).map_err(|e| {
-            let filename = next_path.file_name().map(|n| n.to_string_lossy().to_string());
-            format_load_error(Some(next_path), filename.as_deref(), &e)
-        })
+        self.load_image_from_path_impl(&next_path, false)
+            .map_err(|e| {
+                let filename = next_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string());
+                format_load_error(Some(&next_path), filename.as_deref(), &e)
+            })
     }
 }
 
@@ -484,11 +542,8 @@ fn pick_mip_level(scale: f32, max_levels: usize) -> usize {
 
 fn build_mip_chain(base: egui::ColorImage) -> Vec<egui::ColorImage> {
     let mut levels = vec![base];
-
-    let mut srgb_to_linear_lut = [0u16; 256];
-    for (i, v) in srgb_to_linear_lut.iter_mut().enumerate() {
-        *v = srgb_u8_to_linear_u16(i as u8);
-    }
+    let srgb_to_linear_lut = srgb_to_linear_lut();
+    let linear_to_srgb_lut = linear_to_srgb_lut();
 
     loop {
         let Some(prev) = levels.last() else {
@@ -532,9 +587,9 @@ fn build_mip_chain(base: egui::ColorImage) -> Vec<egui::ColorImage> {
                     (0, 0, 0)
                 } else {
                     (
-                        linear_u16_to_srgb_u8((r_sum / alpha_sum) as u16),
-                        linear_u16_to_srgb_u8((g_sum / alpha_sum) as u16),
-                        linear_u16_to_srgb_u8((b_sum / alpha_sum) as u16),
+                        linear_to_srgb_lut[(r_sum / alpha_sum) as usize],
+                        linear_to_srgb_lut[(g_sum / alpha_sum) as usize],
+                        linear_to_srgb_lut[(b_sum / alpha_sum) as usize],
                     )
                 };
 
@@ -557,6 +612,28 @@ fn build_mip_chain(base: egui::ColorImage) -> Vec<egui::ColorImage> {
     levels
 }
 
+fn srgb_to_linear_lut() -> &'static [u16; 256] {
+    static LUT: OnceLock<[u16; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut lut = [0u16; 256];
+        for (i, v) in lut.iter_mut().enumerate() {
+            *v = srgb_u8_to_linear_u16(i as u8);
+        }
+        lut
+    })
+}
+
+fn linear_to_srgb_lut() -> &'static [u8; 65536] {
+    static LUT: OnceLock<[u8; 65536]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut lut = [0u8; 65536];
+        for (i, v) in lut.iter_mut().enumerate() {
+            *v = linear_to_srgb_u8_slow(i as u16);
+        }
+        lut
+    })
+}
+
 fn srgb_u8_to_linear_u16(v: u8) -> u16 {
     let srgb = (v as f32) / 255.0;
     let linear = if srgb <= 0.04045 {
@@ -567,7 +644,7 @@ fn srgb_u8_to_linear_u16(v: u8) -> u16 {
     (linear.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16
 }
 
-fn linear_u16_to_srgb_u8(v: u16) -> u8 {
+fn linear_to_srgb_u8_slow(v: u16) -> u8 {
     let linear = (v as f32) / 65535.0;
     let srgb = if linear <= 0.0031308 {
         linear * 12.92

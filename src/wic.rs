@@ -5,34 +5,41 @@ use windows::core::HRESULT;
 const RPC_E_CHANGED_MODE_HRESULT: HRESULT = HRESULT(0x80010106u32 as i32);
 
 pub struct WicContext {
+    factory: Option<IWICImagingFactory>,
     should_uninitialize: bool,
 }
 
 impl WicContext {
     pub fn new() -> Result<Self, String> {
-        unsafe {
+        let should_uninitialize = unsafe {
             let res = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             if res == RPC_E_CHANGED_MODE_HRESULT {
-                return Ok(Self {
-                    should_uninitialize: false,
-                });
-            }
-
-            if res.is_err() {
+                false
+            } else if res.is_err() {
                 return Err(format!("Failed to initialize COM: {:?}", res));
+            } else {
+                true
             }
+        };
+
+        unsafe {
+            let factory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
+                .map_err(|e| format!("Failed to create WIC Factory: {:?}", e))?;
+
+            Ok(Self {
+                factory: Some(factory),
+                should_uninitialize,
+            })
         }
-        Ok(Self {
-            should_uninitialize: true,
-        })
     }
 
     pub fn load_from_memory(&self, bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
-        unsafe {
-            let factory: IWICImagingFactory =
-                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
-                    .map_err(|e| format!("Failed to create WIC Factory: {:?}", e))?;
+        let factory = self
+            .factory
+            .as_ref()
+            .ok_or_else(|| "WIC factory is unavailable".to_string())?;
 
+        unsafe {
             let stream = factory
                 .CreateStream()
                 .map_err(|e| format!("Failed to create stream: {:?}", e))?;
@@ -88,6 +95,9 @@ impl WicContext {
 
 impl Drop for WicContext {
     fn drop(&mut self) {
+        // Ensure COM objects are released before COM uninitialization.
+        self.factory.take();
+
         if self.should_uninitialize {
             unsafe {
                 CoUninitialize();
