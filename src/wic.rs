@@ -2,7 +2,7 @@ use windows::Win32::Graphics::Imaging::*;
 use windows::Win32::System::Com::*;
 use windows::core::HRESULT;
 
-const RPC_E_CHANGED_MODE_HRESULT: HRESULT = HRESULT(0x80010106u32 as i32);
+pub(crate) const RPC_E_CHANGED_MODE_HRESULT: HRESULT = HRESULT(0x80010106u32 as i32);
 
 pub struct WicContext {
     factory: Option<IWICImagingFactory>,

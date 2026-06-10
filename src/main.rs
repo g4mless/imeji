@@ -2,9 +2,14 @@
 
 use argh::FromArgs;
 use eframe::egui;
+use std::cmp::Ordering;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use windows::Win32::UI::Shell::StrCmpLogicalW;
+use windows::core::PCWSTR;
 
+mod explorer;
 mod wic;
 
 fn main() -> eframe::Result {
@@ -336,7 +341,10 @@ impl eframe::App for Imeji {
                         .min(1.0);
 
                     let effective_scale = base_scale * self.zoom;
-                    let mip_level = pick_mip_level(effective_scale, self.textures.len());
+                    // Mip selection must use physical pixels, not egui points,
+                    // or high-DPI displays get a mip that is too small (blurry).
+                    let physical_scale = effective_scale * ctx.pixels_per_point();
+                    let mip_level = pick_mip_level(physical_scale, self.textures.len());
                     let texture = &self.textures[mip_level];
 
                     let display_size = base_image_size * effective_scale;
@@ -381,19 +389,37 @@ impl Imeji {
             .parent()
             .ok_or_else(|| "Current image has no parent directory".to_string())?;
 
-        let mut files: Vec<PathBuf> = std::fs::read_dir(parent)
+        let mut files: Vec<DirImage> = std::fs::read_dir(parent)
             .map_err(|e| e.to_string())?
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .filter(|candidate| candidate.is_file() && is_supported_image(candidate))
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                // file_type/metadata come from the directory enumeration on
+                // Windows, so neither costs an extra stat per file.
+                if !entry.file_type().ok()?.is_file() {
+                    return None;
+                }
+                let path = entry.path();
+                if !is_supported_image(&path) {
+                    return None;
+                }
+                let name_w: Vec<u16> = path
+                    .file_name()?
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let metadata = entry.metadata().ok();
+                Some(DirImage {
+                    path,
+                    name_w,
+                    metadata,
+                })
+            })
             .collect();
 
-        files.sort_by_key(|candidate| {
-            candidate
-                .file_name()
-                .map(|n| n.to_string_lossy().to_lowercase())
-                .unwrap_or_default()
-        });
+        let sort = explorer::query_sort_for_folder(parent).unwrap_or(explorer::DEFAULT_SORT);
+        files.sort_by(|a, b| compare_dir_images(a, b, sort));
 
+        let files: Vec<PathBuf> = files.into_iter().map(|f| f.path).collect();
         self.current_dir_index = files.iter().position(|p| p == path);
         self.current_dir_parent = Some(parent.to_path_buf());
         self.current_dir_images = files;
@@ -495,6 +521,50 @@ impl Imeji {
                 format_load_error(Some(&next_path), filename.as_deref(), &e)
             })
     }
+}
+
+struct DirImage {
+    path: PathBuf,
+    /// Null-terminated UTF-16 file name for StrCmpLogicalW.
+    name_w: Vec<u16>,
+    metadata: Option<std::fs::Metadata>,
+}
+
+fn compare_dir_images(a: &DirImage, b: &DirImage, sort: explorer::SortSpec) -> Ordering {
+    let ordering = match sort.key {
+        explorer::SortKey::Name => natural_name_cmp(&a.name_w, &b.name_w),
+        explorer::SortKey::DateModified => file_time_cmp(a, b, |m| m.modified().ok())
+            .then_with(|| natural_name_cmp(&a.name_w, &b.name_w)),
+        explorer::SortKey::DateCreated => file_time_cmp(a, b, |m| m.created().ok())
+            .then_with(|| natural_name_cmp(&a.name_w, &b.name_w)),
+        explorer::SortKey::Size => {
+            let size = |d: &DirImage| d.metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+            size(a)
+                .cmp(&size(b))
+                .then_with(|| natural_name_cmp(&a.name_w, &b.name_w))
+        }
+    };
+    if sort.ascending {
+        ordering
+    } else {
+        ordering.reverse()
+    }
+}
+
+fn file_time_cmp(
+    a: &DirImage,
+    b: &DirImage,
+    time: impl Fn(&std::fs::Metadata) -> Option<std::time::SystemTime>,
+) -> Ordering {
+    let a_time = a.metadata.as_ref().and_then(&time);
+    let b_time = b.metadata.as_ref().and_then(&time);
+    a_time.cmp(&b_time)
+}
+
+/// Explorer-style natural sort ("img2" before "img10").
+fn natural_name_cmp(a: &[u16], b: &[u16]) -> Ordering {
+    let r = unsafe { StrCmpLogicalW(PCWSTR(a.as_ptr()), PCWSTR(b.as_ptr())) };
+    r.cmp(&0)
 }
 
 fn is_supported_image(path: &Path) -> bool {
