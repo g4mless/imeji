@@ -129,6 +129,23 @@ impl eframe::App for Imeji {
             let is_primary_down = i.pointer.primary_down();
             let ctrl_down = i.modifiers.ctrl;
 
+            // Mouse wheels report Line units per notch; touchpad scrolling
+            // reports Point units, so two-finger scroll won't zoom here —
+            // the pinch gesture (zoom_delta) covers touchpads.
+            let wheel_lines: f32 = i
+                .raw
+                .events
+                .iter()
+                .map(|event| match event {
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta,
+                        modifiers,
+                    } if !modifiers.ctrl => delta.y,
+                    _ => 0.0,
+                })
+                .sum();
+
             (
                 dropped_files,
                 smooth_scroll_delta,
@@ -136,11 +153,19 @@ impl eframe::App for Imeji {
                 mouse_pos,
                 is_primary_down,
                 ctrl_down,
+                wheel_lines,
             )
         });
 
-        let (dropped_files, smooth_scroll_delta, zoom_delta, mouse_pos, is_primary_down, ctrl_down) =
-            input;
+        let (
+            dropped_files,
+            smooth_scroll_delta,
+            zoom_delta,
+            mouse_pos,
+            is_primary_down,
+            ctrl_down,
+            wheel_lines,
+        ) = input;
 
         // Handle keyboard shortcut separately (needs mutable access)
         let keyboard_shortcut = ctx.input_mut(|i| {
@@ -259,7 +284,11 @@ impl eframe::App for Imeji {
 
                     let mut zoom_factor = 1.0;
                     if (zoom_delta - 1.0).abs() > f32::EPSILON {
+                        // Touchpad pinch (egui also folds Ctrl+scroll in here).
                         zoom_factor = zoom_delta;
+                    } else if wheel_lines != 0.0 {
+                        // Plain mouse wheel: ~15% per notch.
+                        zoom_factor = 1.15f32.powf(wheel_lines);
                     } else if ctrl_down && smooth_scroll_delta != 0.0 {
                         // Keep Ctrl+wheel zoom as a desktop fallback without hijacking normal scroll.
                         zoom_factor = 1.0 + smooth_scroll_delta * 0.001;
