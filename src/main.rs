@@ -5,7 +5,7 @@ use eframe::egui;
 use std::cmp::Ordering;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, mpsc};
 use windows::Win32::UI::Shell::StrCmpLogicalW;
 use windows::core::PCWSTR;
 
@@ -32,8 +32,8 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Imeji",
         options,
-        Box::new(move |_| {
-            let mut app = Imeji::new();
+        Box::new(move |cc| {
+            let mut app = Imeji::new(cc.egui_ctx.clone());
             if let Some(p) = initial_path {
                 if let Err(err) = app.load_image_from_path(&p) {
                     let filename = p.file_name().map(|n| n.to_string_lossy().to_string());
@@ -57,10 +57,14 @@ fn load_icon() -> Result<egui::IconData, Box<dyn std::error::Error>> {
 
 struct Imeji {
     wic: Option<wic::WicContext>,
-    image_levels: Vec<egui::ColorImage>,
-    base_image_size: Option<egui::Vec2>,
-    textures: Vec<egui::TextureHandle>,
-    filename: Option<String>,
+    decode_tx: mpsc::Sender<DecodeRequest>,
+    decode_rx: mpsc::Receiver<DecodeResult>,
+    generation_counter: u64,
+    /// The image currently on screen.
+    current: Option<LoadedImage>,
+    /// A newly opened image that keeps `current` visible until its first
+    /// texture level finishes decoding.
+    pending_image: Option<LoadedImage>,
     current_path: Option<PathBuf>,
     current_dir_images: Vec<PathBuf>,
     current_dir_index: Option<usize>,
@@ -78,13 +82,15 @@ struct Imeji {
 }
 
 impl Imeji {
-    fn new() -> Self {
+    fn new(ctx: egui::Context) -> Self {
+        let (decode_tx, decode_rx) = spawn_decode_worker(ctx);
         Self {
             wic: None,
-            image_levels: Vec::new(),
-            base_image_size: None,
-            textures: Vec::new(),
-            filename: None,
+            decode_tx,
+            decode_rx,
+            generation_counter: 0,
+            current: None,
+            pending_image: None,
             current_path: None,
             current_dir_images: Vec::new(),
             current_dir_index: None,
@@ -149,7 +155,11 @@ impl eframe::App for Imeji {
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight));
 
         // Update window title when it changes
-        let title = self.filename.as_deref().unwrap_or("Imeji");
+        let title = self
+            .current
+            .as_ref()
+            .and_then(|img| img.filename.as_deref())
+            .unwrap_or("Imeji");
         if self.last_title.as_deref() != Some(title) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.to_string()));
             self.last_title = Some(title.to_string());
@@ -172,7 +182,7 @@ impl eframe::App for Imeji {
                 });
 
             if let Some(bytes) = &dropped_file.bytes {
-                if let Err(err) = self.load_image(bytes, filename.clone()) {
+                if let Err(err) = self.load_image(bytes.clone(), filename.clone()) {
                     self.last_error = Some(format_load_error(None, filename.as_deref(), &err));
                 } else {
                     self.current_path = None;
@@ -192,10 +202,8 @@ impl eframe::App for Imeji {
 
         // Ctrl+W = Close Image
         if keyboard_shortcut {
-            self.image_levels.clear();
-            self.base_image_size = None;
-            self.textures.clear();
-            self.filename = None;
+            self.current = None;
+            self.pending_image = None;
             self.current_path = None;
             self.current_dir_images.clear();
             self.current_dir_index = None;
@@ -217,6 +225,13 @@ impl eframe::App for Imeji {
             ctx.request_repaint();
         }
 
+        // Apply finished background decodes, then make sure a pending image
+        // has its first texture level on the way.
+        while let Ok(result) = self.decode_rx.try_recv() {
+            self.handle_decode_result(ctx, result);
+        }
+        self.request_pending_image_level(ctx);
+
         let current_window_size = ctx.screen_rect().size();
         if let Some(last_size) = self.last_window_size {
             if current_window_size != last_size {
@@ -234,29 +249,9 @@ impl eframe::App for Imeji {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE) // Remove default frame/padding
             .show(ctx, |ui| {
-                if let Some(base_image_size) = self.base_image_size {
-                    if self.textures.len() != self.image_levels.len()
-                        && !self.image_levels.is_empty()
-                    {
-                        let texture_options = egui::TextureOptions {
-                            magnification: egui::TextureFilter::Linear,
-                            minification: egui::TextureFilter::Linear,
-                            wrap_mode: egui::TextureWrapMode::ClampToEdge,
-                            mipmap_mode: None,
-                        };
-                        let levels = std::mem::take(&mut self.image_levels);
-                        self.textures = levels
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, image)| {
-                                ctx.load_texture(
-                                    format!("loaded_image_mip_{i}"),
-                                    image,
-                                    texture_options,
-                                )
-                            })
-                            .collect();
-                    }
+                if let Some(img) = self.current.as_mut() {
+                    let base_image_size =
+                        egui::vec2(img.native_size[0] as f32, img.native_size[1] as f32);
 
                     let screen_rect = ctx.screen_rect();
                     // Use screen rect instead of available_size to avoid UI padding
@@ -344,28 +339,58 @@ impl eframe::App for Imeji {
                     // Mip selection must use physical pixels, not egui points,
                     // or high-DPI displays get a mip that is too small (blurry).
                     let physical_scale = effective_scale * ctx.pixels_per_point();
-                    let mip_level = pick_mip_level(physical_scale, self.textures.len());
-                    let texture = &self.textures[mip_level];
+                    let desired = pick_mip_level(physical_scale, img.textures.len());
 
-                    let display_size = base_image_size * effective_scale;
-                    let center = ui.available_rect_before_wrap().center();
-                    let image_pos = center - display_size * 0.5 + self.pan_offset;
+                    // Ask the background worker for the missing level; until it
+                    // arrives the closest already-decoded level is shown.
+                    if img.textures[desired].is_none() && !img.requested[desired] {
+                        img.requested[desired] = true;
+                        let _ = self.decode_tx.send(DecodeRequest {
+                            generation: img.generation,
+                            level: desired,
+                            target: level_size(img.native_size, desired),
+                            bytes: img.bytes.clone(),
+                        });
+                    }
 
-                    let image_rect = egui::Rect::from_min_size(image_pos, display_size);
-                    let _response = ui.allocate_rect(
-                        ui.available_rect_before_wrap(),
-                        egui::Sense::click_and_drag(),
-                    );
-                    let snapped_image_rect =
-                        snap_rect_to_pixels(image_rect, ctx.pixels_per_point());
+                    // Once the right level is on screen, evict textures that are
+                    // 2+ levels sharper than needed — they are the memory hogs
+                    // and can be re-decoded from `img.bytes` when zooming in.
+                    if img.textures[desired].is_some() {
+                        for i in 0..desired.saturating_sub(1) {
+                            if img.textures[i].is_some() {
+                                img.textures[i] = None;
+                                img.requested[i] = false;
+                            }
+                        }
+                    }
 
-                    if ui.is_rect_visible(snapped_image_rect) {
-                        ui.painter().image(
-                            texture.id(),
-                            snapped_image_rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
+                    if let Some(level) = best_available_level(&img.textures, desired) {
+                        let texture = img.textures[level].as_ref().unwrap();
+
+                        let display_size = base_image_size * effective_scale;
+                        let center = ui.available_rect_before_wrap().center();
+                        let image_pos = center - display_size * 0.5 + self.pan_offset;
+
+                        let image_rect = egui::Rect::from_min_size(image_pos, display_size);
+                        let _response = ui.allocate_rect(
+                            ui.available_rect_before_wrap(),
+                            egui::Sense::click_and_drag(),
                         );
+                        let snapped_image_rect =
+                            snap_rect_to_pixels(image_rect, ctx.pixels_per_point());
+
+                        if ui.is_rect_visible(snapped_image_rect) {
+                            ui.painter().image(
+                                texture.id(),
+                                snapped_image_rect,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                        }
                     }
                 }
             });
@@ -435,29 +460,23 @@ impl Imeji {
             .ok_or_else(|| "Failed to initialize image decoder".to_string())
     }
 
-    fn load_image(&mut self, bytes: &[u8], filename: Option<String>) -> Result<(), String> {
-        let wic_result = self.wic_context().and_then(|w| w.load_from_memory(bytes));
-        match wic_result {
-            Ok((rgba, width, height)) => {
-                let size = [width as usize, height as usize];
-                let base_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
-                self.image_levels = build_mip_chain(base_image);
-                self.base_image_size = Some(egui::vec2(width as f32, height as f32));
-                self.filename = filename;
-                self.textures.clear();
-                // Reset zoom and pan when loading new image
-                self.zoom = 1.0;
-                self.pan_offset = egui::Vec2::ZERO;
-                self.is_dragging = false;
-                self.last_mouse_pos = None;
-                self.last_window_size = None;
-                self.is_animating_to_center = false;
-                self.animation_start_time = None;
-                self.last_error = None;
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+    /// Probes the image size (header only, fast) and schedules the actual
+    /// pixel decoding on the background worker. The previous image stays on
+    /// screen until the first texture level of this one is ready.
+    fn load_image(&mut self, bytes: Arc<[u8]>, filename: Option<String>) -> Result<(), String> {
+        let (width, height) = self.wic_context()?.image_size(&bytes)?;
+        let level_count = mip_level_count(width, height);
+        self.generation_counter += 1;
+        self.pending_image = Some(LoadedImage {
+            generation: self.generation_counter,
+            bytes,
+            filename,
+            native_size: [width, height],
+            textures: (0..level_count).map(|_| None).collect(),
+            requested: vec![false; level_count],
+        });
+        self.last_error = None;
+        Ok(())
     }
 
     fn load_image_from_path_impl(
@@ -467,12 +486,83 @@ impl Imeji {
     ) -> Result<(), String> {
         let filename = path.file_name().map(|n| n.to_string_lossy().to_string());
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        self.load_image(&bytes, filename)?;
+        self.load_image(Arc::from(bytes), filename)?;
         self.current_path = Some(path.to_path_buf());
         if refresh_cache {
             self.refresh_current_dir_cache(path)?;
         }
         Ok(())
+    }
+
+    fn handle_decode_result(&mut self, ctx: &egui::Context, result: DecodeResult) {
+        if let Some(pending) = self.pending_image.as_mut()
+            && pending.generation == result.generation
+        {
+            match result.outcome {
+                Ok(decoded) => {
+                    let texture = upload_texture(ctx, result.generation, result.level, decoded);
+                    pending.textures[result.level] = Some(texture);
+                    self.current = self.pending_image.take();
+                    self.reset_view();
+                }
+                Err(err) => {
+                    let filename = pending.filename.clone();
+                    self.last_error = Some(format_load_error(None, filename.as_deref(), &err));
+                    self.pending_image = None;
+                }
+            }
+            ctx.request_repaint();
+            return;
+        }
+
+        if let Some(img) = self.current.as_mut()
+            && img.generation == result.generation
+        {
+            match result.outcome {
+                Ok(decoded) => {
+                    let texture = upload_texture(ctx, result.generation, result.level, decoded);
+                    img.textures[result.level] = Some(texture);
+                    ctx.request_repaint();
+                }
+                Err(err) => {
+                    let filename = img.filename.clone();
+                    self.last_error = Some(format_load_error(None, filename.as_deref(), &err));
+                }
+            }
+        }
+        // Results for images that were replaced in the meantime are dropped.
+    }
+
+    /// Kicks off decoding of the level a pending image will need once shown
+    /// (it always starts at zoom 1, fit to window).
+    fn request_pending_image_level(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_image.as_mut() else {
+            return;
+        };
+        let avail = ctx.screen_rect().size() * ctx.pixels_per_point();
+        let fit_scale = (avail.x / pending.native_size[0] as f32)
+            .min(avail.y / pending.native_size[1] as f32)
+            .min(1.0);
+        let desired = pick_mip_level(fit_scale, pending.textures.len());
+        if pending.textures[desired].is_none() && !pending.requested[desired] {
+            pending.requested[desired] = true;
+            let _ = self.decode_tx.send(DecodeRequest {
+                generation: pending.generation,
+                level: desired,
+                target: level_size(pending.native_size, desired),
+                bytes: pending.bytes.clone(),
+            });
+        }
+    }
+
+    fn reset_view(&mut self) {
+        self.zoom = 1.0;
+        self.pan_offset = egui::Vec2::ZERO;
+        self.is_dragging = false;
+        self.last_mouse_pos = None;
+        self.last_window_size = None;
+        self.is_animating_to_center = false;
+        self.animation_start_time = None;
     }
 
     fn load_image_from_path(&mut self, path: &Path) -> Result<(), String> {
@@ -610,116 +700,102 @@ fn pick_mip_level(scale: f32, max_levels: usize) -> usize {
     desired.min(max_levels.saturating_sub(1))
 }
 
-fn build_mip_chain(base: egui::ColorImage) -> Vec<egui::ColorImage> {
-    let mut levels = vec![base];
-    let srgb_to_linear_lut = srgb_to_linear_lut();
-    let linear_to_srgb_lut = linear_to_srgb_lut();
+/// An opened image: the compressed source bytes plus lazily decoded texture
+/// levels. Level k is the image at native size / 2^k; levels are decoded by
+/// the background worker only when the view needs them.
+struct LoadedImage {
+    generation: u64,
+    bytes: Arc<[u8]>,
+    filename: Option<String>,
+    native_size: [u32; 2],
+    textures: Vec<Option<egui::TextureHandle>>,
+    requested: Vec<bool>,
+}
 
-    loop {
-        let Some(prev) = levels.last() else {
-            break;
-        };
+struct DecodeRequest {
+    generation: u64,
+    level: usize,
+    target: [u32; 2],
+    bytes: Arc<[u8]>,
+}
 
-        let prev_w = prev.size[0];
-        let prev_h = prev.size[1];
-        if prev_w == 1 && prev_h == 1 {
-            break;
-        }
+struct DecodeResult {
+    generation: u64,
+    level: usize,
+    outcome: Result<wic::DecodedImage, String>,
+}
 
-        let next_w = (prev_w / 2).max(1);
-        let next_h = (prev_h / 2).max(1);
-        let mut next_pixels = Vec::with_capacity(next_w * next_h);
-
-        // Fast 2x2 mip generation, but average colors in linear space (gamma-correct).
-        for y in 0..next_h {
-            for x in 0..next_w {
-                let mut r_sum = 0u64;
-                let mut g_sum = 0u64;
-                let mut b_sum = 0u64;
-                let mut alpha_sum = 0u64;
-                let mut count = 0u64;
-
-                for oy in 0..2usize {
-                    for ox in 0..2usize {
-                        let sx = (x * 2 + ox).min(prev_w - 1);
-                        let sy = (y * 2 + oy).min(prev_h - 1);
-                        let p = prev.pixels[sy * prev_w + sx];
-                        let alpha = p.a() as u64;
-                        r_sum += srgb_to_linear_lut[p.r() as usize] as u64 * alpha;
-                        g_sum += srgb_to_linear_lut[p.g() as usize] as u64 * alpha;
-                        b_sum += srgb_to_linear_lut[p.b() as usize] as u64 * alpha;
-                        alpha_sum += alpha;
-                        count += 1;
-                    }
-                }
-
-                let (r, g, b) = if alpha_sum == 0 {
-                    (0, 0, 0)
-                } else {
-                    (
-                        linear_to_srgb_lut[(r_sum / alpha_sum) as usize],
-                        linear_to_srgb_lut[(g_sum / alpha_sum) as usize],
-                        linear_to_srgb_lut[(b_sum / alpha_sum) as usize],
-                    )
-                };
-
-                next_pixels.push(egui::Color32::from_rgba_unmultiplied(
-                    r,
-                    g,
-                    b,
-                    (alpha_sum / count) as u8,
-                ));
+fn spawn_decode_worker(
+    ctx: egui::Context,
+) -> (mpsc::Sender<DecodeRequest>, mpsc::Receiver<DecodeResult>) {
+    let (request_tx, request_rx) = mpsc::channel::<DecodeRequest>();
+    let (result_tx, result_rx) = mpsc::channel::<DecodeResult>();
+    std::thread::spawn(move || {
+        // The WIC factory must be created and used on this thread only.
+        let wic = wic::WicContext::new();
+        while let Ok(request) = request_rx.recv() {
+            let outcome = match &wic {
+                Ok(w) => w.decode_scaled(&request.bytes, request.target[0], request.target[1]),
+                Err(e) => Err(e.clone()),
+            };
+            let send_failed = result_tx
+                .send(DecodeResult {
+                    generation: request.generation,
+                    level: request.level,
+                    outcome,
+                })
+                .is_err();
+            if send_failed {
+                break;
             }
+            // Wake the UI thread so it picks up the result.
+            ctx.request_repaint();
         }
+    });
+    (request_tx, result_rx)
+}
 
-        levels.push(egui::ColorImage {
-            size: [next_w, next_h],
-            pixels: next_pixels,
-            source_size: egui::vec2(next_w as f32, next_h as f32),
-        });
+const TEXTURE_OPTIONS: egui::TextureOptions = egui::TextureOptions {
+    magnification: egui::TextureFilter::Linear,
+    minification: egui::TextureFilter::Linear,
+    wrap_mode: egui::TextureWrapMode::ClampToEdge,
+    mipmap_mode: None,
+};
+
+fn upload_texture(
+    ctx: &egui::Context,
+    generation: u64,
+    level: usize,
+    decoded: wic::DecodedImage,
+) -> egui::TextureHandle {
+    let image = egui::ColorImage {
+        size: [decoded.width as usize, decoded.height as usize],
+        pixels: decoded.pixels,
+        source_size: egui::vec2(decoded.width as f32, decoded.height as f32),
+    };
+    ctx.load_texture(format!("img_{generation}_mip_{level}"), image, TEXTURE_OPTIONS)
+}
+
+fn mip_level_count(width: u32, height: u32) -> usize {
+    let max_dim = width.max(height).max(1);
+    (32 - max_dim.leading_zeros()) as usize
+}
+
+fn level_size(native: [u32; 2], level: usize) -> [u32; 2] {
+    [(native[0] >> level).max(1), (native[1] >> level).max(1)]
+}
+
+fn best_available_level(
+    textures: &[Option<egui::TextureHandle>],
+    desired: usize,
+) -> Option<usize> {
+    if textures.get(desired)?.is_some() {
+        return Some(desired);
     }
-
-    levels
-}
-
-fn srgb_to_linear_lut() -> &'static [u16; 256] {
-    static LUT: OnceLock<[u16; 256]> = OnceLock::new();
-    LUT.get_or_init(|| {
-        let mut lut = [0u16; 256];
-        for (i, v) in lut.iter_mut().enumerate() {
-            *v = srgb_u8_to_linear_u16(i as u8);
-        }
-        lut
-    })
-}
-
-fn linear_to_srgb_lut() -> &'static [u8; 65536] {
-    static LUT: OnceLock<[u8; 65536]> = OnceLock::new();
-    LUT.get_or_init(|| {
-        let mut lut = [0u8; 65536];
-        for (i, v) in lut.iter_mut().enumerate() {
-            *v = linear_to_srgb_u8_slow(i as u16);
-        }
-        lut
-    })
-}
-
-fn srgb_u8_to_linear_u16(v: u8) -> u16 {
-    let srgb = (v as f32) / 255.0;
-    let linear = if srgb <= 0.04045 {
-        srgb / 12.92
-    } else {
-        ((srgb + 0.055) / 1.055).powf(2.4)
-    };
-    (linear.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16
-}
-
-fn linear_to_srgb_u8_slow(v: u16) -> u8 {
-    let linear = (v as f32) / 65535.0;
-    let srgb = if linear <= 0.0031308 {
-        linear * 12.92
-    } else {
-        1.055 * linear.powf(1.0 / 2.4) - 0.055
-    };
-    (srgb.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+    // Prefer the nearest sharper level (downscaling it looks fine) over an
+    // upscaled blurry one.
+    (0..desired)
+        .rev()
+        .find(|&i| textures[i].is_some())
+        .or_else(|| ((desired + 1)..textures.len()).find(|&i| textures[i].is_some()))
 }
