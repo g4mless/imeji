@@ -621,23 +621,26 @@ struct DirImage {
 }
 
 fn compare_dir_images(a: &DirImage, b: &DirImage, sort: explorer::SortSpec) -> Ordering {
-    let ordering = match sort.key {
-        explorer::SortKey::Name => natural_name_cmp(&a.name_w, &b.name_w),
-        explorer::SortKey::DateModified => file_time_cmp(a, b, |m| m.modified().ok())
+    // Direction applies to the primary key only. Like Explorer, ties always
+    // fall back to natural name order ascending, even in a descending sort.
+    let directed = |ordering: Ordering| {
+        if sort.ascending {
+            ordering
+        } else {
+            ordering.reverse()
+        }
+    };
+    match sort.key {
+        explorer::SortKey::Name => directed(natural_name_cmp(&a.name_w, &b.name_w)),
+        explorer::SortKey::DateModified => directed(file_time_cmp(a, b, |m| m.modified().ok()))
             .then_with(|| natural_name_cmp(&a.name_w, &b.name_w)),
-        explorer::SortKey::DateCreated => file_time_cmp(a, b, |m| m.created().ok())
+        explorer::SortKey::DateCreated => directed(file_time_cmp(a, b, |m| m.created().ok()))
             .then_with(|| natural_name_cmp(&a.name_w, &b.name_w)),
         explorer::SortKey::Size => {
             let size = |d: &DirImage| d.metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-            size(a)
-                .cmp(&size(b))
+            directed(size(a).cmp(&size(b)))
                 .then_with(|| natural_name_cmp(&a.name_w, &b.name_w))
         }
-    };
-    if sort.ascending {
-        ordering
-    } else {
-        ordering.reverse()
     }
 }
 
